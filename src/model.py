@@ -38,17 +38,68 @@ class DataEngine:
                 self.shot_actual = archivo_hdf5
                 return True, "Descarga exitosa."
             else:
-                return False, "El archivo no se encontró en el servidor o en la caché."
+                return False, "El archivo no se encontró."
                 
         except Exception as e:
-            return False, f"❌ Error de conexión: Verifica tu internet o el servidor. Detalle: {e}"
+            return False, f"Error: {e}"
 
+    
+    def obtener_datos_especificos_shot(self, id_shot: int):
+        """
+        MÉTODO CENTRALIZADO: Descarga un shot de manera aislada, utiliza las funciones
+        propias del modelo para procesar y calibrar las señales, y empaqueta los datos
+        para las pestañas de comparación. No altera el estado visual de la app principal.
+        """
+        # 1. Guardar el estado del shot que está abierto actualmente en la App Principal
+        shot_original = self.shot_actual
+        h5py_original = self.shot_h5py
+        
+        try:
+            # Convertir id a entero por seguridad con la SDK
+            id_shot_int = int(id_shot)
+            print(f"[DataEngine] Solicitando switch temporal al shot {id_shot_int} para comparación...")
+            
+            # 2. Utilizar tu método nativo de descarga y asignación de punteros H5
+            exito, msg = self.descargar_datos(id_shot_int)
+            if not exito:
+                print(f"[DataEngine] Error en descarga temporal: {msg}")
+                # Restauramos de inmediato si falla la descarga
+                self.shot_actual = shot_original
+                self.shot_h5py = h5py_original
+                return None
+
+            # 3. REUTILIZAR TUS PROPIOS MÉTODOS DEL ARCHIVO
+            # Al haber ejecutado descargar_datos(), 'self.shot_actual' y 'self.shot_h5py'
+            # ahora apuntan temporalmente al nuevo disparo.
+            t_ip, d_ip = self.obtener_corriente_plasma()
+            t_bt, d_bt = self.obtener_torfield()
+            t_ha, d_ha = self.obtener_Ha()
+            w_length, intensity = self.obtener_espectro_emision()
+
+            # 4. RESTAURAR EL CONTEXTO ORIGINAL DE LA APP
+            # Devolvemos los punteros a su estado inicial para que la pestaña principal no sufra cambios
+            self.shot_actual = shot_original
+            self.shot_h5py = h5py_original
+
+            # Retornar el diccionario con tus arreglos calibrados e integrados de manera idéntica
+            return {
+                "t_ip": t_ip, "d_ip": d_ip,
+                "t_bt": t_bt, "d_bt": d_bt,
+                "t_ha": t_ha, "d_ha": d_ha,
+                "w_length": w_length, "intensity": intensity
+            }
+
+        except Exception as e:
+            print(f"[DataEngine] Error crítico aislando datos del shot {id_shot}: {e}")
+            # En caso de cualquier caída imprevista, nos aseguramos de restaurar el entorno por seguridad
+            self.shot_actual = shot_original
+            self.shot_h5py = h5py_original
+            return None
 
     def obtener_lista_shots(self):
         """
         Obtiene la lista completa de shots hechos
         """
-        
         lista_disparos = self.client.get_shots_list()
 
         if not lista_disparos:

@@ -13,6 +13,8 @@ from shot_comparison_tab import ShotComparisonTab
 from fast_camera_tab import FastCameraTab  # Nueva pestaña agregada de forma modular
 from eq_rec_tab import EqRecTab
 
+
+
 def hacer_espectrograma(tiempo, señal, nperseg=512, noverlap=256, fmin_contraste=2):
     dt = np.mean(np.diff(tiempo))
     fs = 1 / dt
@@ -118,6 +120,7 @@ class App(tk.Tk):
             activebackground="#555555", activeforeground="white", relief="flat", padx=15
         )
         self.apply_time_btn.pack(side="left", padx=15)
+
 
         # --- INICIALIZACIÓN DE LAS PANTALLAS ---
         self.crear_mecanismo_pestaña("principal", "Señales Principales", self.setup_graficos)
