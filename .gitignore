@@ -1,0 +1,14 @@
+# Entornos virtuales y caché
+.venv/
+.cache/
+__pycache__/
+*.pyc
+
+# Archivos de datos pesados del Tokamak (Locales)
+*.csv
+*.dat
+MephistDataKit/
+rto_mephist/
+
+# Archivos temporales de pruebas
+test.txt
