@@ -37,7 +37,11 @@ La herramienta cuenta funciones tales como la inspección de parametros como la 
 ## :page_with_curl: Tareas pendientes (24 de mayo, 2026)
 - [X] Creación del repositorio de github
 - [ ] Unificar el código en un solo visualizador
-- [ ] Revisión de bugs
+   * + [ ] Manejar de manera centralizada los archivos
+   * + [ ] Crear carpetas para eqrec y fastcamera
+   * + [ ] Encontrar fuente de los archivos de las descargas anteriores, sino mostrar con mensaje *No se ha encontrado información para el shot pedido*
+   * + [ ] Integrar el residuals de Marcelo
+   * + [ ] Revisión de bugs
 - [ ] Relacionar parametros controlados con el desarrollo de las descargas
 - [ ] Realizazión del reporte
 

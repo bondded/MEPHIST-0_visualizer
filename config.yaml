@@ -8,7 +8,7 @@ server:
 
 # Аутентификация ПОМЕНЯЙТЕ ТОКЕН НА СВОЙ
 auth:
-  api_token: "EigVwAYnuNqmt47mrD6bLsgezGQR84hbLTD6RSoTHU2FTVfSld3YWRSTaBlp"
+  api_token: "Token access"
 
 # Настройки загрузки данных
 download:
