@@ -34,7 +34,7 @@ La herramienta cuenta funciones tales como la inspección de parametros como la 
 * EqReq
 * FastCamera
 
-## :page_with_curl: Tareas pendientes (24 de mayo, 2026)
+## :page_with_curl: Tareas pendientes (25 de mayo, 2026)
 - [X] Creación del repositorio de github
 - [X] Unificar el código en un solo visualizador
    * + [X] Manejar de manera centralizada los archivos
