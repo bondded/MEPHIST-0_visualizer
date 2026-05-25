@@ -180,11 +180,10 @@ class App(tk.Tk):
                         ax.set_xlim([self.tmin, self.tmax])
                     self.canvas.draw()
                     
-                elif self.pestaña_activa == "comparacion" and hasattr(self, "comp_tab"):
-                    self.comp_tab.ax_ip.set_xlim([self.tmin, self.tmax])
-                    self.comp_tab.ax_bt.set_xlim([self.tmin, self.tmax])
-                    self.comp_tab.ax_ha.set_xlim([self.tmin, self.tmax])
-                    self.comp_tab.canvas.draw()
+                elif self.pestaña_activa == "comparacion":
+                    # La pestaña de comparación gestiona sus propios rangos y normalizaciones avanzadas (tau, sync).
+                    # Dejamos que use sus controles internos.
+                    pass
                     
                 print(f"Rango de tiempo sincronizado: {self.tmin} - {self.tmax} ms")
             else:
@@ -193,10 +192,10 @@ class App(tk.Tk):
             print("Error: Ingrese valores numéricos válidos")
 
     def load_shot(self):
-        if self.pestaña_activa in ["camara", "eqrec"]:
-            print("Para procesamiento de video, use los controles internos del panel.")
-        elif self.pestaña_activa == "comparacion":
-            self.comp_tab.cargar_nuevo_shot_overlay()
+        # Ignorar acción si estamos en la pestaña de comparación, cámara o eqrec
+        if self.pestaña_activa in ["camara", "eqrec", "comparacion"]:
+            print("Para esta pestaña, use los controles internos del panel que aparecen abajo.")
+            messagebox.showinfo("Aviso", "Utiliza el botón 'Load Shots' dentro de la barra de esta pestaña.")
         else:
             # Flujo estándar para Principal/Mirnov
             shot_num = simpledialog.askstring("Cargar Shot", "Ingrese número de Shot:")
@@ -209,14 +208,15 @@ class App(tk.Tk):
                 messagebox.showerror("Error", f"No se pudo cargar el shot: {str(e)}")
 
     def limpiar(self):
-        if self.pestaña_activa == "comparacion":
-            self.comp_tab.limpiar_comparacion()
-        elif self.pestaña_activa == "camara":
+        if self.pestaña_activa == "camara":
             self.camara_tab.input_folder_var.set("")
             self.camara_tab.output_file_var.set("")
         elif self.pestaña_activa == "eqrec":
             self.eqrec_tab.input_folder_var.set("")
             self.eqrec_tab.output_file_var.set("")
+        elif self.pestaña_activa == "comparacion":
+            # La limpieza se hace con el botón 'Clear Shots' de su propio toolbar
+            messagebox.showinfo("Aviso", "Utiliza el botón 'Clear Shots' dentro de la barra de esta pestaña.")
         else:
             frame_actual = self.pestañas[self.pestaña_activa]["frame"]
             for widget in frame_actual.winfo_children():

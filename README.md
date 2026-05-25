@@ -53,7 +53,6 @@ Modificaciones
 - [ ] revisar zoom.
 - [ ] el manejo de archivo centralizado.
 - [ ] implementar el uso de carpetas locales.
-- [ ] 
 
 ## :page_with_curl: Documentación visualizador de datos (apuntes)
 
