@@ -43,7 +43,17 @@ La herramienta cuenta funciones tales como la inspección de parametros como la 
    * + [ ] Integrar el residuals de Marcelo
    * + [ ] Revisión de bugs
 - [ ] Relacionar parametros controlados con el desarrollo de las descargas
+- [ ] Supuesta saturación de la presión, la presión es demasiado alta, se espera ver descargas progresivamente más cortas, y la linea de emisión de Hierro cada vez más alta.
+- [ ] Normalización por duración de la descarga y por la integral de la corriente en el tiempo de la duración de la descarga. Intentar hacer conexión con la página o tener localmente. 
+- [ ] Ajustar gausianas en las lineas de emisión.
+- [ ] Implementar un filtro de lineas de emisión.
 - [ ] Realizazión del reporte
+
+Modificaciones
+- [ ] revisar zoom.
+- [ ] el manejo de archivo centralizado.
+- [ ] implementar el uso de carpetas locales.
+- [ ] 
 
 ## :page_with_curl: Documentación visualizador de datos (apuntes)
 
@@ -51,4 +61,6 @@ Pedir una llave de acceso en MEPHIST e ingresarla en el archivo config.yaml-
 
 Hay que tomar los datos del post procesado de manera manual para evitar errores. 
 
-La función de corriente funciona bien, pero las demas debería hacerlas de manera manual.				
+La función de corriente funciona bien, pero las demas debería hacerlas de manera manual.		
+
+
