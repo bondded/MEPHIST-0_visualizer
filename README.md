@@ -26,7 +26,7 @@ La herramienta cuenta funciones tales como la inspección de parametros como la 
    ```bash
    uv run src/main.py
    ```
-
+potoooo
 ## :chart_with_upwards_trend: Características principales
 * Visualización rápida de descargas
 * Comparación de shots 
