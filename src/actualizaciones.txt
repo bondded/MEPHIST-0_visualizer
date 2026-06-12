@@ -1,0 +1,7 @@
+(Diego) (12-06-2026): Refactorización del código, ahora las pestañas son fáciles de leer. Aún faltan cosas como:
+
+* File manager: Cliente para descarga (logica)
+* MHD analysis: Pestaña de analisis MHD
+* Preferences : Manejo inteligente de rutas e inspección de archivos
+.nxs
+* Figure      : Generación de figuras verticales a gusto

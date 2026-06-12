@@ -1,111 +1,174 @@
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
-from matplotlib.widgets import MultiCursor
-from matplotlib.gridspec import GridSpec
-import numpy as np
-from scipy import signal
+from tkinter import messagebox
 
-# Importar módulos importantes del proyecto
 from model import DataEngine
 from shot_comparison_tab import ShotComparisonTab
-from fast_camera_tab import FastCameraTab  
+from fast_camera_tab import FastCameraTab
 from eq_rec_tab import EqRecTab
-
-
+from file_manager_tab import FileManagerTab
 
 
 class App(tk.Tk):
+    """Clase principal del Visualizador MEPHIST-0."""
 
     def __init__(self):
         super().__init__()
-
-
-        # Configuración Ventana Principal
-        self.title("Visualizador MEPHIST-0")
-        self.geometry("1920x1080")
+        self.title("MEPHIST-0 diagnostic visualizer v1.0")
+        try:
+            icono_app = tk.PhotoImage(file="./src/atom_emoji.png")
+            self.iconphoto(True, icono_app)
+        except tk.TclError:
+            print("No se encontró el archivo del ícono, cargando el predeterminado...")
         self.configure(bg="white")
-
+        try:
+            self.state("zoomed")  
+        except tk.TclError:
+            self.attributes('-zoomed', True)
         self.fuente_ui = ("Roboto", 11)
         self.fuente_negrita = ("Roboto", 11, "bold")
 
         self.modelo = DataEngine()
 
-        # 2. Barra Secundaria de Pestañas (Estilo Sublime Text)
         self.tab_bar_frame = tk.Frame(self, bg="#e0e0e0", height=35)
         self.tab_bar_frame.pack(side="top", fill="x")
-
-        # 3. Contenedor Principal de Pantallas
         self.contenedor_vistas = tk.Frame(self, bg="white")
         self.contenedor_vistas.pack(side="top", fill="both", expand=True)
-
-        # Controladores de Pestañas
+        
         self.pestañas = {}
         self.pestaña_activa = None
+        
+        self.crear_mecanismo_pestaña(
+            "principal", "Principal signals", self.setup_pantalla_comparativa
+        )
+        self.crear_mecanismo_pestaña(
+            "camara", "Fast camera", self.setup_pantalla_camara
+        )
+        self.crear_mecanismo_pestaña(
+            "mhd", "MHD analysis", self.setup_pantalla_mhd
+        )
+        self.crear_mecanismo_pestaña(
+            "preferences", "Preferences", self.setup_pantalla_configuracion
+        )
+        self.crear_mecanismo_pestaña(
+            "download", "File manager", self.setup_pantalla_descarga
+        )
+        self.crear_mecanismo_pestaña(
+            "figure", "Figure", self.setup_pantalla_figura
+        )
+        self.mostrar_pantalla("download")
+        self.after(100, self.forzar_redibujo)
 
-        self.crear_mecanismo_pestaña("principal", "Principal signals", self.setup_pantalla_comparativa)
-        self.crear_mecanismo_pestaña("camara", "Fast camera", self.setup_pantalla_camara)
-        #self.crear_mecanismo_pestaña("mhd", "MHD analysis", self.setup_graficos_mhd) Por implementar
-        self.crear_mecanismo_pestaña("mag_rec", "Magnetic reconstruction", self.setup_pantalla_magrec)
-        self.mostrar_pantalla("principal")
+        ruta_actualizaciones = "./src/actualizaciones.txt"
+        mostrar_actualizaciones = False
+        if mostrar_actualizaciones:
+            try:
+                with open(ruta_actualizaciones, "r", encoding="utf-8") as archivo:
+                    contenido = archivo.read()
+                messagebox.showinfo("Actualizaciones! ₍^. .^₎Ⳋ", contenido)
+            except FileNotFoundError:
+                messagebox.showerror("ups", "el archivo de actualizaciones se murió")
+
+    def forzar_redibujo(self):
+        """
+        Fuerza el redibujado para tener las pantallas centradas
+        """
+        try:
+            self.state("normal")
+            self.update_idletasks()
+            self.state("zoomed")
+        except tk.TclError:
+            pass
 
     def crear_mecanismo_pestaña(self, id_pestaña, titulo_pestaña, setup_funcion):
+        """Crea el mecanismo para activar las pestañas y sus funcionalidades."""
         frame_contenido = tk.Frame(self.contenedor_vistas, bg="white")
         boton_pestaña = tk.Button(
-            self.tab_bar_frame, text=titulo_pestaña, font=self.fuente_ui,
+            self.tab_bar_frame,
+            text=titulo_pestaña,
+            font=self.fuente_ui,
             command=lambda: self.mostrar_pantalla(id_pestaña),
-            bg="#d0d0d0", fg="black", activebackground="white", activeforeground="black",
-            relief="flat", bd=0, padx=15, pady=5
+            bg="#d0d0d0",
+            fg="black",
+            activebackground="white",
+            activeforeground="black",
+            relief="flat",
+            bd=0,
+            padx=15,
+            pady=5
         )
-        boton_pestaña.pack(side="left", padx=2, pady=(4, 0))
+        if id_pestaña in ["download", "preferences"]:
+            boton_pestaña.pack(side="right", padx=2, pady=(4, 0))
+        else:
+            boton_pestaña.pack(side="left", padx=2, pady=(4, 0))
 
         self.pestañas[id_pestaña] = {
             "frame": frame_contenido,
             "boton": boton_pestaña,
-            "titulo": f"Visualizador MEPHIST-0 - {titulo_pestaña}",
+            "titulo": f"MEPHIST-0 diagnostic visualizer v1.0 | {titulo_pestaña}",
         }
-        
-        if id_pestaña in ["principal", "camara", "mag_rec"]:
+
+        pestañas = ["principal", "camara", "mhd", "download", "figure", "preferences"] 
+        if id_pestaña in pestañas:
             setup_funcion(frame_contenido)
         else:
             setup_funcion()
 
     def mostrar_pantalla(self, nombre_pantalla):
+        """Muestra la pantalla seleccionada en la pestaña."""
         if self.pestaña_activa:
             self.pestañas[self.pestaña_activa]["frame"].pack_forget()
-            self.pestañas[self.pestaña_activa]["boton"].configure(bg="#d0d0d0", fg="black")
+            self.pestañas[self.pestaña_activa]["boton"].configure(
+                bg="#d0d0d0", fg="black"
+            )
 
         self.pestañas[nombre_pantalla]["frame"].pack(fill="both", expand=True)
-        self.pestañas[nombre_pantalla]["boton"].configure(bg="white", fg="black")
+        self.pestañas[nombre_pantalla]["boton"].configure(
+            bg="white", fg="black"
+        )
         self.title(self.pestañas[nombre_pantalla]["titulo"])
         self.pestaña_activa = nombre_pantalla
 
+        if self.pestaña_activa in ["mhd", "figure", "preferences"]:
+            messagebox.showinfo(
+                "En desarrollo... ₍^. .^₎Ⳋ",
+                "Esta pestaña está siendo actualizada."
+            )
 
     def setup_pantalla_comparativa(self, container_frame):
+        """Instancia el panel de pantalla principal."""
         self.comp_tab = ShotComparisonTab(container_frame, self)
 
     def setup_pantalla_camara(self, container_frame):
-        """ Instancia el panel de conversión de video para la cámara rápida """
+        """Instancia el panel de conversión de video para la cámara rápida."""
         self.camara_tab = FastCameraTab(container_frame, self)
 
-# @ Implementar
-#    def setup_pantalla_mhd(self, container_frame):
-#        self.mhd_tab = MHDTab(container_frame, self)
-
     def setup_pantalla_magrec(self, container_frame):
-        """ Instancia el panel modular para el video de las reconstrucciones de equilibrio """
-        self.eqrec_tab = EqRecTab(container_frame, self)
-   
+        """Instancia el panel modular para las reconstrucciones de equilibrio."""
+        # self.eqrec_tab = EqRecTab(container_frame, self)
+
+    def setup_pantalla_mhd(self, container_frame):
+        """Instancia el panel de análisis MHD."""
+
+    def setup_pantalla_descarga(self, container_frame):
+        """Instancia el panel de descarga e inspección."""
+        self.descarga_tab = FileManagerTab(container_frame, self)
 
 
+    def setup_pantalla_figura(self, container_frame):
+        """Instancia el panel de analisis de figura."""
 
+    def setup_pantalla_configuracion(self, container_frame):
+        """Instancia el panel de analisis de figura."""
+
+        
 
 if __name__ == "__main__":
     app = App()
     app.mainloop()
-    
 
+
+# @ Código para reutilización en el futuro.
+# ----------------------------------------------------------------------------
 # Parámetros por defecto de visualización
 #        self.tmin = 6.5  
 #        self.tmax = 10  
@@ -114,7 +177,6 @@ if __name__ == "__main__":
 #        self.nperseg = 36  
 #        self.noverlap = self.nperseg * 0.9  
 #        self.q_max = 10  
-
 # ----------------------------------------------------------------------------
 # Funciones dedicadas al procesamiento de datos importantes para señales la 
 # primera función se encarga de la creación de espectrogramas y la segunda 
@@ -146,7 +208,6 @@ if __name__ == "__main__":
 #     amps = np.abs(hs) * (2.0 / n)
 #     return fs, amps
 # ----------------------------------------------------------------------------
-
 # @ Reutilizar
 #    def actualizar_rango_tiempo(self):
 #        try:
@@ -209,7 +270,6 @@ if __name__ == "__main__":
 #            elif self.pestaña_activa == "mhd":
 #                self.setup_graficos_mhd()
 # ----------------------------------------------------------------------------
-
 # @ Reutilizar
 #    def actualizar_gráficos(self):
 #        if not hasattr(self, "axes"): return
@@ -295,7 +355,6 @@ if __name__ == "__main__":
 #        self.fig.tight_layout()
 #        self.canvas.draw()
 # ----------------------------------------------------------------------------
-
 # @ Reutilizar     
 #    def setup_graficos(self):
 #        master_frame = self.pestañas["principal"]["frame"]
@@ -318,7 +377,6 @@ if __name__ == "__main__":
 #        )
 #        self.canvas.draw()
 # ----------------------------------------------------------------------------
-
 # @ Reutilizar
 #    def setup_graficos_mhd(self):
 #        master_frame = self.pestañas["mhd"]["frame"]
@@ -343,8 +401,7 @@ if __name__ == "__main__":
 #        self.canvas_mhd = FigureCanvasTkAgg(self.fig_mhd, master=master_frame)
 #        self.canvas_mhd.get_tk_widget().pack(fill="both", expand=True)
 #        self.canvas_mhd.draw()
-
-
+#
 #    def actualizar_gráficos_mhd(self):
 #        if not hasattr(self, "axes_mhd"): return
 #        tiempo_Ip, corriente_Ip = self.modelo.obtener_corriente_plasma()
