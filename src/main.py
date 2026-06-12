@@ -4,8 +4,9 @@ from tkinter import messagebox
 from model import DataEngine
 from shot_comparison_tab import ShotComparisonTab
 from fast_camera_tab import FastCameraTab
-from eq_rec_tab import EqRecTab
 from file_manager_tab import FileManagerTab
+from preferences_tab import PreferencesTab
+from figure_tab import FigureTab
 
 
 class App(tk.Tk):
@@ -38,7 +39,7 @@ class App(tk.Tk):
         self.pestaña_activa = None
         
         self.crear_mecanismo_pestaña(
-            "principal", "Principal signals", self.setup_pantalla_comparativa
+            "principal", "Home", self.setup_pantalla_comparativa
         )
         self.crear_mecanismo_pestaña(
             "camara", "Fast camera", self.setup_pantalla_camara
@@ -128,7 +129,7 @@ class App(tk.Tk):
         self.title(self.pestañas[nombre_pantalla]["titulo"])
         self.pestaña_activa = nombre_pantalla
 
-        if self.pestaña_activa in ["mhd", "figure", "preferences"]:
+        if self.pestaña_activa in ["mhd", "figure", "preferences", "download"]:
             messagebox.showinfo(
                 "En desarrollo... ₍^. .^₎Ⳋ",
                 "Esta pestaña está siendo actualizada."
@@ -156,9 +157,11 @@ class App(tk.Tk):
 
     def setup_pantalla_figura(self, container_frame):
         """Instancia el panel de analisis de figura."""
+        self.figura_tab = FigureTab(container_frame, self)
 
     def setup_pantalla_configuracion(self, container_frame):
         """Instancia el panel de analisis de figura."""
+        self.config_tab = PreferencesTab(container_frame, self)
 
         
 
