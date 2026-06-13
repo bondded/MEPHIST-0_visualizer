@@ -56,7 +56,7 @@ class App(tk.Tk):
         self.crear_mecanismo_pestaña(
             "figure", "Figure", self.setup_pantalla_figura
         )
-        self.mostrar_pantalla("download")
+        self.mostrar_pantalla("preferences")
         self.after(100, self.forzar_redibujo)
 
         ruta_actualizaciones = "./src/actualizaciones.txt"
@@ -129,7 +129,7 @@ class App(tk.Tk):
         self.title(self.pestañas[nombre_pantalla]["titulo"])
         self.pestaña_activa = nombre_pantalla
 
-        if self.pestaña_activa in ["mhd", "figure", "preferences", "download"]:
+        if self.pestaña_activa in ["mhd", "figure", "download"]:
             messagebox.showinfo(
                 "En desarrollo... ₍^. .^₎Ⳋ",
                 "Esta pestaña está siendo actualizada."
