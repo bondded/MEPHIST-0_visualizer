@@ -2,10 +2,6 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import h5py
 
-import os
-import cv2
-import threading
-
 class FileManagerTab:
     """
     Gestiona la pestaña de manejo de datos de la aplicación. Permite entre otras cosas
