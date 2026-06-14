@@ -1,6 +1,9 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import h5py
+import os
+from model import DataEngine
+import csv
 
 class FileManagerTab:
     """
@@ -13,11 +16,10 @@ class FileManagerTab:
         self.master_frame = master_frame
         self.app = app_instance 
 
-        self.input_folder_var = tk.StringVar()
-        self.output_file_var = tk.StringVar()
-        self.original_fps_var = tk.StringVar(value="10000")
-        self.playback_fps_var = tk.StringVar(value="10")
-
+        self.input_token_var = tk.StringVar(value="C8yvwmWZ8THNjwBgaBJz43DWomyl3yNcStgwTXf3hAd3WaXNqtlI46kRaD5L")
+        self.token = tk.StringVar()
+        self.shots = tk.StringVar()
+        self.tabla = None
         self.setup_ui_file_manager()
 
     def setup_ui_file_manager(self):
@@ -34,27 +36,30 @@ class FileManagerTab:
 
         lbl_token = tk.Label(main_form, text="Token", font=self.app.fuente_negrita, bg="white", fg="black")
         lbl_token.grid(row=1, column=0, sticky="e", pady=5, padx=5)
-        ent_token = tk.Entry(main_form, textvariable=self.input_folder_var, width=60, font=self.app.fuente_ui, show="•")
+        ent_token = tk.Entry(main_form, textvariable=self.input_token_var, width=60, font=self.app.fuente_ui, show="•")  
         ent_token.grid(row=1, column=1, padx=5, pady=5)
+        self.token.set(ent_token.get())
 
         btn_test = tk.Button(main_form, text="Prueba de conexión", font=self.app.fuente_ui, command=self.probar_conexion,
                            bg="#e0e0e0", relief="flat", padx=10, width=20)
         btn_test.grid(row=1, column=2, padx=5, pady=5)
 
-        self.status_label = tk.Label(main_form, text="Estado: Conexión establecida ✅", font=self.app.fuente_ui, bg="white", fg="green")
-        self.status_label.grid(row=2, column=1, columnspan=3, sticky="w")
+        self.status_conection_label = tk.Label(main_form, text="Estado: Esperando prueba...", font=self.app.fuente_ui, bg="white", fg="gray")
+        self.status_conection_label.grid(row=2, column=1, columnspan=3, sticky="w")
 
         lbl_download = tk.Label(main_form, text="Shots", font=self.app.fuente_negrita, bg="white", fg="black")
         lbl_download.grid(row=3, column=0, sticky="e", pady=5)
-        ent_download = tk.Entry(main_form, textvariable=self.output_file_var, width=60, font=self.app.fuente_ui)
+        ent_download = tk.Entry(main_form,textvariable=self.shots, width=60, font=self.app.fuente_ui)
         ent_download.grid(row=3, column=1, padx=5, pady=5)
+        self.shots.set(ent_download.get())
+
         btn_download  = tk.Button(main_form, text="Descargar", font=self.app.fuente_ui, command=self.descargar_shots,
                             bg="#e0e0e0", relief="flat", padx=10, width=20)
         btn_download.grid(row=3, column=2, padx=5, pady=5)
 
         self.progress_bar = ttk.Progressbar(main_form, orient="horizontal", mode="determinate")
         self.progress_bar.grid(row=4, column=1, columnspan=1, sticky="ew", pady=(20, 5))
-        self.status_label = tk.Label(main_form, text="Estado: Listo para descargar", font=self.app.fuente_ui, bg="white", fg="gray")
+        self.status_label = tk.Label(main_form, text="Estado: Esperando prueba...", font=self.app.fuente_ui, bg="white", fg="gray")
         self.status_label.grid(row=5, column=1, columnspan=3, sticky="w")
 
         db_title = tk.Label(main_form, text="🗂️ Base de datos MEPHIST-0", 
@@ -65,7 +70,7 @@ class FileManagerTab:
         tabla_frame.grid(row=8, column=0, columnspan=3, pady=20, sticky="nsew")
         scroll_y = ttk.Scrollbar(tabla_frame, orient="vertical")
         scroll_y.pack(side="right", fill="y")
-        columnas = ("id_shot", "fecha", "working_gas", "pressure", "discharge", "plasma_duration" ,"Ip_max", "Bt_max")
+        columnas = ("id_shot", "fecha", "peso", "pressure", "working_gas", "Ip_max")
         tabla = ttk.Treeview(
             tabla_frame, 
             columns=columnas, 
@@ -76,32 +81,22 @@ class FileManagerTab:
         tabla.pack(side="left", fill="both", expand=True)
         scroll_y.config(command=tabla.yview)
 
-        tabla.heading("id_shot", text="shot number")
+        tabla.heading("id_shot", text="shot")
         tabla.heading("fecha", text="date")
+        tabla.heading("peso", text="peso (mb)")
+        tabla.heading("pressure", text="pressure (mPa)")
         tabla.heading("working_gas", text="working gas")
-        tabla.heading("pressure", text="pressure")
-        tabla.heading("discharge", text="discharge")
-        tabla.heading("plasma_duration", text="plasma duration")
-        tabla.heading("Ip_max", text="Ip max")
-        tabla.heading("Bt_max", text="Bt_max")
-        tabla.column("id_shot", width=100, anchor="center")
+        tabla.heading("Ip_max", text="Ip max (kA)")
+        tabla.column("id_shot", width=60, anchor="center")
         tabla.column("fecha", width=100, anchor="center")
-        tabla.column("working_gas", width=90, anchor="center")
+        tabla.column("peso", width=90, anchor="center")
         tabla.column("pressure", width=100, anchor="center")
-        tabla.column("discharge", width=120, anchor="w")
-        tabla.column("plasma_duration", width=120, anchor="center")
-        tabla.column("Ip_max", width=90, anchor="center")
-        tabla.column("Bt_max", width=90, anchor="center")
+        tabla.column("working_gas", width=100, anchor="center")
+        tabla.column("Ip_max", width=100, anchor="center")
 
-        # --- Agregar datos de prueba (Simulación de catálogo del MephiST-0) ---
-        datos_prueba = [
-            ("1024", "2026-06-10", "H2", "5.2e-4 mbar", "Ohmic", "45 ms", "2.5 kA", "0.8 T"),
-            ("1025", "2026-06-10", "He", "6.1e-4 mbar", "Ohmic", "42 ms", "2.4 kA", "0.8 T"),
-            ("1026", "2026-06-11", "H2", "4.8e-4 mbar", "Disrupted", "12 ms", "1.8 kA", "0.8 T"),
-            ("1027", "2026-06-11", "H2", "5.0e-4 mbar", "Ohmic", "50 ms", "2.6 kA", "0.8 T")
-        ]
-        for fila in datos_prueba:
-            tabla.insert("", tk.END, values=fila)
+        self.tabla = tabla
+        #self.app.modelo.actualizar_base_datos()
+        self.poblar_tabla_desde_csv()
 
         btn_inspector = tk.Button(
         main_form, 
@@ -181,9 +176,67 @@ class FileManagerTab:
 
 
     def probar_conexion(self):
-        print("Hola")
-
+        estado, respuesta = self.app.modelo.test_conexion()
+        token = self.token.get()
+        self.app.modelo.actualizar_token_yaml(token)
+        if respuesta:
+            self.status_conection_label.config(
+                text="Estado: Conexión establecida ✅",
+                fg="green"
+            )
+            self.status_label.config(
+                text="Estado: Listo para descargar ✅",
+                fg="green"
+            )
+        else:
+            self.status_conection_label.config(
+                text="Estado: No se pudo conectar al servidor ❌",
+                fg="red"
+            )            
+            self.status_label.config(
+                text="Estado: No se puede descargar ❌",
+                fg="red"
+            )
+        self.master_frame.update_idletasks()
+        
     def descargar_shots(self):
-        print("Hola")
+        shots_str = self.shots.get()
+        shots = [int(x) for x in shots_str.split(",")]
+        total_shots = len(shots)
+        self.progress_bar["maximum"] = total_shots
+        self.progress_bar["value"] = 0
+        for i, shot in enumerate(shots):
+            self.status_label.config(
+                text=f"Estado: Descargando shot {shot} ({i + 1}/{total_shots})",
+                fg="blue"
+            )
+            self.master_frame.update_idletasks()
+
+            estado, respuesta = self.app.modelo.descargar_datos(shot)
         
+            self.progress_bar["value"] = i + 1
+            self.master_frame.update_idletasks()
+
+        self.status_label.config(text="Estado: Completado!", fg="green")
+
+    def poblar_tabla_desde_csv(self):
+        archivo_permanente = "catalogo_mephist0.csv"
         
+        # Si el archivo no existe, no hacemos nada
+        if not os.path.exists(archivo_permanente):
+            return
+
+        # 1. Limpiar la tabla actual (para no duplicar datos visualmente si refrescas)
+        for fila_existente in self.tabla.get_children():
+            self.tabla.delete(fila_existente)
+
+        # 2. Leer el archivo y agregar las filas
+        with open(archivo_permanente, mode='r', encoding='utf-8') as archivo_csv:
+            lector = csv.reader(archivo_csv)
+            
+            # Saltamos la primera línea (las cabeceras)
+            next(lector, None) 
+            
+            # Recorremos cada línea de datos y la insertamos en el Treeview
+            for fila_datos in lector:
+                self.tabla.insert("", tk.END, values=fila_datos)

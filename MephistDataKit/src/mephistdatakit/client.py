@@ -38,7 +38,7 @@ class Client:
         
         self.base_url = config.base_url
         self.base_path = config.base_path
-        self.api_token = config.api_token
+        self.api_token = str(config.api_token) # arreglo a la mala JKLFDSJLKFDS despues lo devolvemos
         self.cache_enabled = config.cache_enabled
         self.cache_dir = config.cache_dir
         self.timeout = config.timeout

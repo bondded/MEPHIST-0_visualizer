@@ -2076,6 +2076,7 @@ dependencies = [
     { name = "opencv-python" },
     { name = "pandas" },
     { name = "pyqt6" },
+    { name = "pyyaml" },
     { name = "scipy" },
 ]
 
@@ -2089,6 +2090,7 @@ requires-dist = [
     { name = "opencv-python", specifier = ">=4.13.0.92" },
     { name = "pandas", specifier = ">=3.0.2" },
     { name = "pyqt6", specifier = ">=6.11.0" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "scipy", specifier = ">=1.17.1" },
 ]
 

@@ -13,22 +13,16 @@ class FigureTab:
         self.master_frame = master_frame
         self.app = app_instance
 
-        self.diagnosticos_disponibles = [
-            "Ip",
-            "Bt",
-            "H-alpha",
-            "V_loop_N",
-            "ne",
-            "Te",
-            "q_a",
-            "Mirnov_coil_N",
-            "Mirnov_spectrogram_N",
-            "Spectroscopy",
-            "poloidal_beta (MHD)",
-            "pressure",
-            "I_CS",
-            "I_PF_N"
-        ]
+        self.diagnosticos_disponibles = {
+            "plasma current" : "Ip (kA)",
+            "toroidal field" : "Bt (T)",
+            "H-alpha emission": "H-alpha (a.u.)",
+            "Voltage loops": "(VL2 + VL7)/2 (V)",
+            "electron density": "ne (m-3)",
+            "electron temperature": "Te (keV)",
+            "r = a safety factor": "q(a)",
+            "emission spectrum": "Intensity",
+        }
 
         self.setup_ui_figure()
 
@@ -50,10 +44,11 @@ class FigureTab:
         # Barra de herramientas nativa de Matplotlib (Zoom, Guardar, Mover)
         self.toolbar = NavigationToolbar2Tk(self.canvas, self.plot_frame)
         self.toolbar.update()
-
+        ent_shot = tk.Entry(self.master_frame, textvariable="", width=30, font=self.app.fuente_ui)
+        #ent_shot.grid(row=0, column=1, sticky="w", relief="flat")
         # --- PANEL DERECHO: SELECTOR DE DIAGNÓSTICOS (1/4) ---
         self.control_frame = tk.Frame(self.master_frame, bg="#f8f9fa", relief="ridge", bd=1)
-        self.control_frame.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
+        self.control_frame.grid(row=1, column=1, sticky="nsew", padx=10, pady=10)
 
         lbl_titulo = tk.Label(self.control_frame, text="Available diagnostics", 
                               font=self.app.fuente_negrita, bg="#f8f9fa", fg="black")
@@ -91,11 +86,21 @@ class FigureTab:
         )
         btn_exportar.pack(fill="x", padx=15, pady=20)
 
-    def actualizar_graficos(self):
+
+    def actualizar_graficos(self, id_shot=1500):
         """Lee los diagnósticos seleccionados y redibuja la figura apilada."""
-        # Obtener los índices y luego los textos seleccionados en la Listbox
+        # Obtener los índices y luego los textos (llaves) seleccionados en la Listbox
         indices = self.listbox.curselection()
         seleccion = [self.listbox.get(i) for i in indices]
+
+        #time_ip, data_ip = self.app.modelo.obtener_corriente_plasma(id_shot)
+        #time_ip, data_ip = self.app.modelo.obtener_corriente_plasma(id_shot)
+        #time_ip, data_ip = self.app.modelo.obtener_corriente_plasma(id_shot)
+        #time_ip, data_ip = self.app.modelo.obtener_corriente_plasma(id_shot)
+        #time_ip, data_ip = self.app.modelo.obtener_corriente_plasma(id_shot)
+        #time_ip, data_ip = self.app.modelo.obtener_corriente_plasma(id_shot)
+        #time_ip, data_ip = self.app.modelo.obtener_corriente_plasma(id_shot)
+        #time_ip, data_ip = self.app.modelo.obtener_corriente_plasma(id_shot)
 
         if not seleccion:
             # Si el usuario deseleccionó todo, limpiamos la pantalla
@@ -118,8 +123,12 @@ class FigureTab:
             axs = [axs]
 
         # 3. Dibujar la señal en cada subplot correspondiente
-        for i, nombre_señal in enumerate(seleccion):
+        for i, nombre_llave in enumerate(seleccion):
             ax = axs[i]
+            
+            # --- LA MAGIA DEL DICCIONARIO ---
+            # Buscamos el valor técnico (ej: "Ip (kA)") usando la llave (ej: "plasma current")
+            etiqueta_eje_y = self.diagnosticos_disponibles[nombre_llave]
             
             # --- AQUÍ CONECTARÍAS CON TU DATA ENGINE ---
             # Por ahora, generamos una curva de prueba simulada
@@ -129,7 +138,9 @@ class FigureTab:
             # -------------------------------------------
             
             ax.plot(t, señal_simulada, color="black", linewidth=1.2)
-            ax.set_ylabel(nombre_señal, fontsize=10, fontweight="bold")
+            
+            # Inyectamos el VALOR del diccionario en el eje Y
+            ax.set_ylabel(etiqueta_eje_y, fontsize=10, fontweight="bold")
             ax.grid(True, linestyle="--", alpha=0.5)
             
             # Quitar marcas del eje X en los gráficos de arriba para que se vea más limpio
@@ -137,11 +148,10 @@ class FigureTab:
                 ax.tick_params(labelbottom=False)
 
         # 4. Configurar el eje X solo en el último gráfico de abajo
-        axs[-1].set_xlabel("Time [ms]", fontsize=10, fontweight="bold")
+        axs[-1].set_xlabel("time [ms]", fontsize=10, fontweight="bold")
         
         # Ajustar los márgenes para que nada quede cortado
         self.figura.tight_layout()
         
         # Enviar la orden a Tkinter para que muestre el nuevo dibujo
         self.canvas.draw()
-
