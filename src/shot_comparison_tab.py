@@ -326,7 +326,7 @@ def get_spectroscopy_rw_normalized_arrays(data):
 #
 # You can override it with the environment variable:
 #   MEPHIST_EMISSION_LINES_DIR=C:/path/to/Lineas de emisión
-EMISSION_LINES_FOLDER_NAME = "Lineas de emisión"
+EMISSION_LINES_FOLDER_NAME = "Líneas de emisión"
 EMISSION_LINE_FILE_EXTENSIONS = (".csv", ".txt", ".tsv")
 
 # NIST-to-experiment matching parameters.
