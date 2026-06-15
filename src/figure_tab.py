@@ -48,7 +48,7 @@ class FigureTab:
         #ent_shot.grid(row=0, column=1, sticky="w", relief="flat")
         # --- PANEL DERECHO: SELECTOR DE DIAGNÓSTICOS (1/4) ---
         self.control_frame = tk.Frame(self.master_frame, bg="#f8f9fa", relief="ridge", bd=1)
-        self.control_frame.grid(row=1, column=1, sticky="nsew", padx=10, pady=10)
+        self.control_frame.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
 
         lbl_titulo = tk.Label(self.control_frame, text="Available diagnostics", 
                               font=self.app.fuente_negrita, bg="#f8f9fa", fg="black")
