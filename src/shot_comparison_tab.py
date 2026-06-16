@@ -333,11 +333,70 @@ EMISSION_LINE_FILE_EXTENSIONS = (".csv", ".txt", ".tsv")
 # MATCH_TOLERANCE_NM should be comparable to the Avantes/Ocean-FX resolution
 # reported for MEPhIST-0 (~0.5 nm). Here 1.0 nm is used to absorb
 # wavelength calibration offsets such as H-alpha 656.28 nm measured near 657.0 nm.
-NIST_MATCH_TOLERANCE_NM = 1.00
+NIST_MATCH_TOLERANCE_NM = 0.60
 NIST_MIN_RELATIVE_PEAK_HEIGHT = 0.03
 NIST_NOISE_SIGMA_FACTOR = 5.0
 NIST_LOCAL_BACKGROUND_WINDOW_NM = 2.0
 NIST_MIN_PROMINENCE_RELATIVE = 0.01
+
+# Spectroscopy calibration and robust peak/feature matching.
+# Balmer wavelengths are used only for an optional calibration step; matching
+# can still be performed without calibration. Wavelengths are in air [nm].
+HYDROGEN_BALMER_LINES_NM = [
+    ("H_alpha", 656.2790),
+    ("H_beta", 486.1350),
+    ("H_gamma", 434.0472),
+    ("H_delta", 410.1734),
+    ("H_epsilon", 397.0075),
+    ("H_zeta", 388.9064),
+]
+SPECTROSCOPY_CALIBRATION_SEARCH_WINDOW_NM = 1.5
+SPECTROSCOPY_CALIBRATION_DEFAULT_DEGREE = 2
+SPECTROSCOPY_FEATURE_MERGE_NM = 0.55
+SPECTROSCOPY_MIN_FEATURE_WIDTH_POINTS = 2
+
+# Balmer lines are physically privileged for H discharges. Fe has a very dense
+# visible spectrum and can otherwise steal broad/plateau-like Balmer features.
+# These constants only affect known H Balmer transitions and keep NIST intensity
+# as secondary information.
+SPECTROSCOPY_BALMER_MATCH_TOLERANCE_NM = 0.60
+SPECTROSCOPY_BALMER_PRIORITY_BOOST = 0.65
+SPECTROSCOPY_DEFAULT_SHOW_ONLY_GLOBAL_BEST = True
+
+# Instrument-resolution exclusion rule for final accepted lines.
+# After calibration, accepted H Balmer anchors are kept fixed and every accepted
+# line blocks +/- this half-width in NIST wavelength space. This avoids assigning
+# several "best" global lines inside one unresolved instrumental-resolution band.
+SPECTROSCOPY_ACCEPTED_LINE_EXCLUSION_HALF_WIDTH_NM = 0.60
+
+# Physical priors used only as a weak tie-breaker in ambiguous multi-element
+# assignments. Nitrogen is intentionally above oxygen because residual air is
+# mostly N2; carbon is kept as a low-priority contaminant unless the data strongly
+# supports it. These values are not probabilities, only ranking weights.
+SPECTROSCOPY_ELEMENT_PRIOR = {
+    "H": 1.00,
+    "Fe": 0.86,
+    "W": 0.82,
+    "N": 0.58,
+    "O": 0.48,
+    "C": 0.34,
+    "Ar": 0.25,
+    "He": 0.25,
+}
+SPECTROSCOPY_ELEMENT_PRIOR_WEIGHT = 0.12
+# No density penalty is applied: if Fe has many lines, that is physical/diagnostic
+# information rather than something to suppress. The column can still be exported
+# for diagnostics, but its weight is zero.
+SPECTROSCOPY_LINE_DENSITY_PENALTY_WEIGHT = 0.0
+
+# Temporal H-alpha is kept as diagnostic support for spectroscopy. It is not used
+# as a hard absolute threshold by default because the photodiode H-alpha signal and
+# the Avantes spectrum are in different arbitrary units. The table exports the
+# integral, duration and mean over the real H-alpha window so you can correlate
+# line identifications with temporal H-alpha strength.
+SPECTROSCOPY_USE_HALPHA_TEMPORAL_SUPPORT_FILTER = False
+SPECTROSCOPY_HALPHA_TEMPORAL_MIN_MEAN = 0.0
+
 
 
 # =========================================================
@@ -2122,51 +2181,216 @@ def is_local_peak(wavelengths, intensities, idx, half_width_points=2):
     return intensities[idx] >= np.nanmax(local)
 
 
-def match_nist_lines_for_shot(
-    wavelengths_exp,
-    intensity_exp,
-    nist_df,
-    element_label,
-    shot_number,
-    tolerance_nm=NIST_MATCH_TOLERANCE_NM,
-    min_relative_peak_height=NIST_MIN_RELATIVE_PEAK_HEIGHT,
-    noise_sigma_factor=NIST_NOISE_SIGMA_FACTOR,
-    local_background_window_nm=NIST_LOCAL_BACKGROUND_WINDOW_NM,
-    min_prominence_relative=NIST_MIN_PROMINENCE_RELATIVE,
+def normalize_01(values):
+    """Return values scaled to [0, 1] while keeping NaNs as 0."""
+    arr = pd.to_numeric(pd.Series(values), errors="coerce").astype(float)
+    arr = arr.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    vmin = float(arr.min()) if len(arr) else 0.0
+    vmax = float(arr.max()) if len(arr) else 0.0
+    if not np.isfinite(vmax - vmin) or abs(vmax - vmin) < 1e-15:
+        return np.zeros(len(arr), dtype=float)
+    return ((arr - vmin) / (vmax - vmin)).to_numpy(dtype=float)
+
+
+def apply_wavelength_calibration(wavelengths, coefficients):
+    """Apply polynomial calibration lambda_true = poly(lambda_measured)."""
+    wl = np.asarray(wavelengths, dtype=float)
+    if coefficients is None:
+        return wl
+    try:
+        coeffs = np.asarray(coefficients, dtype=float)
+    except Exception:
+        return wl
+    if coeffs.size == 0 or not np.all(np.isfinite(coeffs)):
+        return wl
+    return np.polyval(coeffs, wl)
+
+
+
+def get_hydrogen_balmer_match(wavelength_nm, tolerance_nm=0.08):
+    """Return (name, lambda_nist, distance) for a known Balmer line, or None."""
+    try:
+        lam = float(wavelength_nm)
+    except Exception:
+        return None
+    if not np.isfinite(lam):
+        return None
+    best = None
+    for name, lam0 in HYDROGEN_BALMER_LINES_NM:
+        d = abs(lam - float(lam0))
+        if d <= tolerance_nm and (best is None or d < best[2]):
+            best = (name, float(lam0), float(d))
+    return best
+
+
+def is_hydrogen_balmer_candidate(element_label, wavelength_nm):
+    """True only for H candidates that correspond to one of the Balmer lines."""
+    if str(element_label).strip().lower() not in {"h", "h i", "hi", "hydrogen"}:
+        return False
+    return get_hydrogen_balmer_match(wavelength_nm) is not None
+
+
+def get_match_tolerance_for_candidate(element_label, wavelength_nm, base_tolerance_nm):
+    """Use a slightly wider matching window only for known H Balmer lines."""
+    if is_hydrogen_balmer_candidate(element_label, wavelength_nm):
+        return max(float(base_tolerance_nm), float(SPECTROSCOPY_BALMER_MATCH_TOLERANCE_NM))
+    return float(base_tolerance_nm)
+
+
+def normalize_element_label(element_label):
+    """Normalize element labels from local NIST filenames/tables."""
+    s = str(element_label).strip()
+    if not s:
+        return ""
+    # Keep only the leading chemical symbol, e.g. 'Fe I' -> 'Fe'.
+    m = re.match(r"([A-Za-z]{1,2})", s)
+    if not m:
+        return s
+    sym = m.group(1)
+    return sym[0].upper() + sym[1:].lower()
+
+
+def get_element_prior_score(element_label):
+    """Weak physical prior used only for ambiguous feature assignment."""
+    sym = normalize_element_label(element_label)
+    return float(SPECTROSCOPY_ELEMENT_PRIOR.get(sym, 0.30))
+
+
+def get_halpha_temporal_support_metrics(data):
+    """Return H-alpha temporal metrics over its own emission window.
+
+    This uses Halpha_start_5pct -> Halpha_end, not the full Ip plasma duration.
+    The result is diagnostic support for spectroscopy, not an absolute cross-device
+    intensity calibration.
+    """
+    try:
+        m = compute_halpha_integral_metrics(data)
+    except Exception:
+        m = None
+    if not m:
+        return {
+            "halpha_temporal_integral_real_time_positive": np.nan,
+            "halpha_temporal_duration_s_real_window": np.nan,
+            "halpha_temporal_mean_real_window": np.nan,
+            "halpha_temporal_start_ms": np.nan,
+            "halpha_temporal_end_ms": np.nan,
+        }
+    duration_ms = m.get("Halpha_real_duration_ms_5pct_to_end", np.nan)
+    duration_s = duration_ms / 1000.0 if np.isfinite(duration_ms) else np.nan
+    integral = m.get("Halpha_integral_real_time_positive", np.nan)
+    mean_val = integral / duration_s if np.isfinite(integral) and np.isfinite(duration_s) and duration_s > 0 else np.nan
+    return {
+        "halpha_temporal_integral_real_time_positive": integral,
+        "halpha_temporal_duration_s_real_window": duration_s,
+        "halpha_temporal_mean_real_window": mean_val,
+        "halpha_temporal_start_ms": m.get("Halpha_start_5pct_ms", np.nan),
+        "halpha_temporal_end_ms": m.get("Halpha_end_ms", np.nan),
+    }
+
+
+def estimate_local_spectral_center(
+    wavelengths,
+    intensities,
+    line_center_nm,
+    window_nm=NIST_MATCH_TOLERANCE_NM,
+    background_window_nm=NIST_LOCAL_BACKGROUND_WINDOW_NM,
+    raw_wavelengths=None,
 ):
     """
-    Match local NIST lines directly against the experimental wavelength array.
+    Estimate a robust experimental wavelength for a candidate line.
 
-    This version does NOT require an isolated local peak. That is important for
-    Avantes spectra where strong lines can be saturated, clipped, or appear as a
-    plateau instead of a sharp maximum.
-
-    For each NIST wavelength lambda_0, the code inspects the real experimental
-    samples inside:
-
-        |lambda_exp - lambda_0| <= tolerance_nm
-
-    and accepts the line if the local experimental signal is significantly above
-    the robust noise/background level.
-
-    Accepted intensity is the maximum experimental normalized RW intensity inside
-    the wavelength window. When several selected elements match the same
-    experimental wavelength bin, the final table keeps only the most plausible
-    candidate using only the NIST relative intensity; wavelength proximity is only a tie-breaker.
+    Instead of taking only the single highest sample, this computes a centroid
+    of the positive signal above a local background inside the matching window.
+    This reduces the bias introduced when a physical line is sampled by several
+    spectrometer pixels or appears as a small plateau.
     """
-    wl = np.asarray(wavelengths_exp, dtype=float)
-    y = np.asarray(intensity_exp, dtype=float)
+    wl = np.asarray(wavelengths, dtype=float)
+    y = np.asarray(intensities, dtype=float)
+    raw_wl = np.asarray(raw_wavelengths, dtype=float) if raw_wavelengths is not None else wl.copy()
+    if raw_wl.shape != wl.shape:
+        raw_wl = wl.copy()
 
-    if wl.size == 0 or y.size == 0 or wl.shape != y.shape or nist_df is None or len(nist_df) == 0:
-        return pd.DataFrame()
+    mask = np.isfinite(wl) & np.isfinite(y) & np.isfinite(raw_wl) & (np.abs(wl - line_center_nm) <= window_nm)
+    if np.sum(mask) < 1:
+        return None
 
+    local_wl = wl[mask]
+    local_raw_wl = raw_wl[mask]
+    local_y = y[mask]
+    if local_wl.size == 0:
+        return None
+
+    bg_mask = (
+        np.isfinite(wl) & np.isfinite(y)
+        & (wl >= line_center_nm - background_window_nm)
+        & (wl <= line_center_nm + background_window_nm)
+        & (np.abs(wl - line_center_nm) > window_nm)
+    )
+    if np.any(bg_mask):
+        local_background = float(np.nanmedian(y[bg_mask]))
+    else:
+        local_background = float(np.nanmedian(y[np.isfinite(y)])) if np.any(np.isfinite(y)) else 0.0
+
+    weights = positive_part(local_y - local_background)
+    peak_pos = int(np.nanargmax(local_y))
+    peak_wl = float(local_wl[peak_pos])
+    peak_intensity = float(local_y[peak_pos])
+
+    if np.sum(weights) > 0:
+        centroid_wl = float(np.sum(local_wl * weights) / np.sum(weights))
+        centroid_raw_wl = float(np.sum(local_raw_wl * weights) / np.sum(weights))
+    else:
+        centroid_wl = peak_wl
+        centroid_raw_wl = float(local_raw_wl[peak_pos])
+
+    local_excess = peak_intensity - local_background
+    local_integral = safe_area(local_wl, weights)
+    local_mean = float(np.nanmean(local_y)) if local_y.size else np.nan
+    width_nm = float(np.nanmax(local_wl) - np.nanmin(local_wl)) if local_wl.size > 1 else 0.0
+
+    return {
+        "center_nm": centroid_wl,
+        "raw_center_nm": centroid_raw_wl,
+        "peak_wavelength_nm": peak_wl,
+        "raw_peak_wavelength_nm": float(local_raw_wl[peak_pos]),
+        "peak_intensity": peak_intensity,
+        "local_background": local_background,
+        "local_excess": local_excess,
+        "local_integrated_intensity": local_integral,
+        "local_mean_intensity": local_mean,
+        "window_width_nm": width_nm,
+        "n_points_in_window": int(local_wl.size),
+    }
+
+
+def detect_spectrum_features(
+    wavelengths,
+    intensities,
+    min_relative_peak_height=NIST_MIN_RELATIVE_PEAK_HEIGHT,
+    noise_sigma_factor=NIST_NOISE_SIGMA_FACTOR,
+    merge_nm=SPECTROSCOPY_FEATURE_MERGE_NM,
+):
+    """
+    Detect experimental spectral features before assigning elements.
+
+    A feature is a contiguous significant region of the experimental spectrum.
+    This prevents many adjacent spectrometer samples on the same broad line or
+    plateau from being interpreted as many independent physical lines.
+    """
+    wl = np.asarray(wavelengths, dtype=float)
+    y = np.asarray(intensities, dtype=float)
+
+    # This detector only needs the wavelength axis currently used for matching
+    # (raw if uncalibrated, calibrated if calibration is enabled). A previous
+    # draft accidentally referenced raw_wl here without defining it, which broke
+    # the spectroscopy buttons at runtime.
     finite = np.isfinite(wl) & np.isfinite(y)
     wl = wl[finite]
     y = y[finite]
+
     if wl.size < 3:
         return pd.DataFrame()
 
-    # Ensure increasing wavelength order.
     order = np.argsort(wl)
     wl = wl[order]
     y = y[order]
@@ -2175,26 +2399,175 @@ def match_nist_lines_for_shot(
     if not np.isfinite(y_max) or y_max <= 0:
         return pd.DataFrame()
 
-    # Robust baseline/noise over the full spectrum. This avoids counting small
-    # fluctuations as real lines. The user can tune noise_sigma_factor and
-    # min_relative_peak_height in the filter panel.
+    baseline, sigma = robust_noise_level(y)
+    threshold = max(baseline + noise_sigma_factor * sigma, min_relative_peak_height * y_max)
+    above = y >= threshold
+
+    features = []
+    i = 0
+    feature_id = 0
+    n = len(wl)
+
+    while i < n:
+        if not above[i]:
+            i += 1
+            continue
+
+        start_idx = i
+        last_idx = i
+        i += 1
+        while i < n and above[i] and (wl[i] - wl[last_idx] <= max(merge_nm, 1e-12)):
+            last_idx = i
+            i += 1
+
+        end_idx = last_idx
+        if end_idx - start_idx + 1 < SPECTROSCOPY_MIN_FEATURE_WIDTH_POINTS:
+            # Keep very narrow but very strong isolated samples; otherwise skip.
+            if y[start_idx] < 0.25 * y_max:
+                continue
+
+        region_wl = wl[start_idx:end_idx + 1]
+        region_y = y[start_idx:end_idx + 1]
+        peak_local = int(np.nanargmax(region_y))
+        peak_idx = start_idx + peak_local
+        peak_wl = float(wl[peak_idx])
+        peak_intensity = float(y[peak_idx])
+
+        ring_mask = (
+            (wl >= region_wl[0] - NIST_LOCAL_BACKGROUND_WINDOW_NM)
+            & (wl <= region_wl[-1] + NIST_LOCAL_BACKGROUND_WINDOW_NM)
+            & ((wl < region_wl[0]) | (wl > region_wl[-1]))
+        )
+        if np.any(ring_mask):
+            local_background = float(np.nanmedian(y[ring_mask]))
+        else:
+            local_background = baseline
+
+        weights = positive_part(region_y - local_background)
+        if np.sum(weights) > 0:
+            center_nm = float(np.sum(region_wl * weights) / np.sum(weights))
+        else:
+            center_nm = peak_wl
+
+        local_excess = peak_intensity - local_background
+        feature_width_nm = float(region_wl[-1] - region_wl[0]) if len(region_wl) > 1 else 0.0
+
+        features.append({
+            "experimental_feature_id": feature_id,
+            "feature_center_nm": center_nm,
+            "feature_peak_wavelength_nm": peak_wl,
+            "feature_peak_intensity": peak_intensity,
+            "feature_start_nm": float(region_wl[0]),
+            "feature_end_nm": float(region_wl[-1]),
+            "feature_width_nm": feature_width_nm,
+            "feature_start_index": int(start_idx),
+            "feature_end_index": int(end_idx),
+            "feature_background": local_background,
+            "feature_excess": local_excess,
+            "feature_integrated_intensity": safe_area(region_wl, positive_part(region_y - local_background)),
+            "feature_n_points": int(len(region_wl)),
+            "feature_relative_intensity": peak_intensity / y_max if y_max > 0 else np.nan,
+        })
+        feature_id += 1
+
+    return pd.DataFrame(features)
+
+
+def assign_feature_to_candidate(features_df, experimental_wavelength_nm, nist_wavelength_nm, tolerance_nm):
+    """Assign a candidate to an already detected experimental spectral feature."""
+    if features_df is None or features_df.empty:
+        bin_width = max(tolerance_nm / 2.0, 1e-9)
+        return {
+            "experimental_feature_id": int(np.round(experimental_wavelength_nm / bin_width)),
+            "feature_center_nm": experimental_wavelength_nm,
+            "feature_peak_wavelength_nm": experimental_wavelength_nm,
+            "feature_start_nm": experimental_wavelength_nm,
+            "feature_end_nm": experimental_wavelength_nm,
+            "feature_width_nm": 0.0,
+            "feature_n_points": 1,
+        }
+
+    f = features_df.copy()
+    overlaps = f[
+        (f["feature_start_nm"] <= nist_wavelength_nm + tolerance_nm)
+        & (f["feature_end_nm"] >= nist_wavelength_nm - tolerance_nm)
+    ].copy()
+
+    if overlaps.empty:
+        overlaps = f.copy()
+
+    overlaps["distance_to_candidate"] = np.minimum(
+        np.abs(overlaps["feature_center_nm"].astype(float) - experimental_wavelength_nm),
+        np.abs(overlaps["feature_peak_wavelength_nm"].astype(float) - experimental_wavelength_nm),
+    )
+    best = overlaps.sort_values("distance_to_candidate").iloc[0]
+    return best.to_dict()
+
+
+def match_nist_lines_for_shot(
+    wavelengths_exp,
+    intensity_exp,
+    nist_df,
+    element_label,
+    shot_number,
+    wavelengths_raw=None,
+    tolerance_nm=NIST_MATCH_TOLERANCE_NM,
+    min_relative_peak_height=NIST_MIN_RELATIVE_PEAK_HEIGHT,
+    noise_sigma_factor=NIST_NOISE_SIGMA_FACTOR,
+    local_background_window_nm=NIST_LOCAL_BACKGROUND_WINDOW_NM,
+    min_prominence_relative=NIST_MIN_PROMINENCE_RELATIVE,
+):
+    """
+    Build candidate NIST-element matches for one shot and one element file.
+
+    Key changes relative to the older pointwise matcher:
+      - experimental spectral features are detected before element assignment;
+      - each NIST line is matched to a robust centroid/peak within its tolerance
+        window, instead of blindly using every high sample as a separate line;
+      - NIST relative intensity is stored but is not the main physical ranking
+        criterion across different elements.
+    """
+    wl = np.asarray(wavelengths_exp, dtype=float)
+    y = np.asarray(intensity_exp, dtype=float)
+    raw_wl = np.asarray(wavelengths_raw, dtype=float) if wavelengths_raw is not None else wl.copy()
+
+    if wl.size == 0 or y.size == 0 or wl.shape != y.shape or raw_wl.shape != wl.shape or nist_df is None or len(nist_df) == 0:
+        return pd.DataFrame()
+
+    finite = np.isfinite(wl) & np.isfinite(y) & np.isfinite(raw_wl)
+    wl = wl[finite]
+    raw_wl = raw_wl[finite]
+    y = y[finite]
+    if wl.size < 3:
+        return pd.DataFrame()
+
+    order = np.argsort(wl)
+    wl = wl[order]
+    raw_wl = raw_wl[order]
+    y = y[order]
+
+    y_max = float(np.nanmax(y))
+    if not np.isfinite(y_max) or y_max <= 0:
+        return pd.DataFrame()
+
     baseline, noise_sigma = robust_noise_level(y)
     absolute_threshold = max(
         baseline + noise_sigma_factor * noise_sigma,
         min_relative_peak_height * y_max,
     )
-
-    # Local-background criterion. It is weaker than a local-peak requirement:
-    # it only asks whether the signal in the NIST window is above the nearby
-    # continuum/noise. This keeps plateau/saturated regions detectable.
     min_local_excess = max(
         noise_sigma_factor * noise_sigma,
         min_prominence_relative * y_max,
     )
 
-    rows = []
+    features_df = detect_spectrum_features(
+        wl,
+        y,
+        min_relative_peak_height=min_relative_peak_height,
+        noise_sigma_factor=noise_sigma_factor,
+        merge_nm=max(tolerance_nm * 0.55, SPECTROSCOPY_FEATURE_MERGE_NM),
+    )
 
-    # Try to keep optional NIST columns if they exist.
     nist_intensity_col = None
     for candidate in ['intens', 'Intensity', 'Rel.', 'rel_intensity']:
         if candidate in nist_df.columns:
@@ -2203,30 +2576,37 @@ def match_nist_lines_for_shot(
 
     source_file = str(nist_df['source_file'].iloc[0]) if 'source_file' in nist_df.columns and len(nist_df) else ''
     lambda_source = str(nist_df['lambda_source'].iloc[0]) if 'lambda_source' in nist_df.columns and len(nist_df) else ''
+    try:
+        nist_lambda_array = pd.to_numeric(nist_df.get('lambda_nm', pd.Series(dtype=float)), errors='coerce').dropna().to_numpy(dtype=float)
+    except Exception:
+        nist_lambda_array = np.array([], dtype=float)
 
+    rows = []
     for _, line in nist_df.iterrows():
         lam_nist = float(line.get('lambda_nm', np.nan))
         if not np.isfinite(lam_nist):
             continue
 
-        # Direct wavelength-window search in the experimental arrays.
-        window_mask = np.abs(wl - lam_nist) <= tolerance_nm
-        if not np.any(window_mask):
+        is_balmer = is_hydrogen_balmer_candidate(element_label, lam_nist)
+        balmer_info = get_hydrogen_balmer_match(lam_nist) if is_balmer else None
+        local_tolerance_nm = get_match_tolerance_for_candidate(
+            element_label,
+            lam_nist,
+            tolerance_nm
+        )
+
+        local = estimate_local_spectral_center(
+            wl,
+            y,
+            lam_nist,
+            window_nm=local_tolerance_nm,
+            background_window_nm=local_background_window_nm,
+            raw_wavelengths=raw_wl,
+        )
+        if local is None:
             continue
 
-        local_indices = np.where(window_mask)[0]
-        local_wl = wl[local_indices]
-        local_y = y[local_indices]
-        if local_y.size == 0:
-            continue
-
-        local_max_pos = int(np.nanargmax(local_y))
-        best_idx = int(local_indices[local_max_pos])
-        best_wl = float(wl[best_idx])
-        best_intensity = float(y[best_idx])
-        delta_nm = best_wl - lam_nist
-
-        # Reject noise using global robust threshold + relative threshold.
+        best_intensity = float(local["peak_intensity"])
         if best_intensity < absolute_threshold:
             continue
 
@@ -2234,28 +2614,15 @@ def match_nist_lines_for_shot(
         if rel_height < min_relative_peak_height:
             continue
 
-        # Estimate nearby background from a ring around the NIST line. Exclude
-        # the actual matching window to avoid subtracting the line/plateau itself.
-        bg_mask = (
-            (wl >= lam_nist - local_background_window_nm)
-            & (wl <= lam_nist + local_background_window_nm)
-            & (np.abs(wl - lam_nist) > tolerance_nm)
-        )
-        if np.any(bg_mask):
-            local_background = float(np.nanmedian(y[bg_mask]))
-        else:
-            local_background = baseline
-
-        local_excess = best_intensity - local_background
-        if local_excess < min_local_excess:
+        if float(local["local_excess"]) < min_local_excess:
             continue
 
-        # Integrated local signal over the NIST tolerance window after subtracting
-        # local background. This is not the ranking column by default, but it is
-        # useful when a line appears as a broad plateau rather than a sharp peak.
-        local_signal_bg_sub = positive_part(local_y - local_background)
-        local_integral = safe_area(local_wl, local_signal_bg_sub)
-        local_mean = float(np.nanmean(local_y)) if len(local_y) else np.nan
+        exp_wl = float(local["center_nm"])
+        exp_raw_wl = float(local.get("raw_center_nm", exp_wl))
+        delta_nm = exp_wl - lam_nist
+        feature = assign_feature_to_candidate(features_df, exp_wl, lam_nist, local_tolerance_nm)
+
+        local_line_density = int(np.sum(np.abs(nist_lambda_array - lam_nist) <= local_tolerance_nm)) if nist_lambda_array.size else 1
 
         nist_intensity = ''
         nist_intensity_numeric = np.nan
@@ -2268,53 +2635,95 @@ def match_nist_lines_for_shot(
             'type of element': element_label,
             'wavelength': lam_nist,
             'intensity': best_intensity,
-            'experimental_wavelength_nm': best_wl,
+            'experimental_wavelength_nm': exp_wl,
+            'experimental_raw_wavelength_nm': exp_raw_wl,
+            'experimental_calibrated_wavelength_nm': exp_wl,
+            'experimental_peak_wavelength_nm': float(local["peak_wavelength_nm"]),
+            'experimental_raw_peak_wavelength_nm': float(local.get("raw_peak_wavelength_nm", local["peak_wavelength_nm"])),
             'delta_nm': delta_nm,
             'relative_intensity_in_shot': rel_height,
-            'local_background': local_background,
-            'local_excess': local_excess,
-            'local_mean_intensity': local_mean,
-            'local_integrated_intensity': local_integral,
+            'local_background': float(local["local_background"]),
+            'local_excess': float(local["local_excess"]),
+            'local_mean_intensity': float(local["local_mean_intensity"]),
+            'local_integrated_intensity': float(local["local_integrated_intensity"]),
+            'n_points_in_matching_window': int(local["n_points_in_window"]),
+            'matching_window_width_nm': float(local["window_width_nm"]),
+            'match_tolerance_used_nm': float(local_tolerance_nm),
+            'nist_local_line_density': local_line_density,
+            'element_prior_score': get_element_prior_score(element_label),
+            'is_hydrogen_balmer': bool(is_balmer),
+            'hydrogen_balmer_name': balmer_info[0] if balmer_info is not None else "",
+            'hydrogen_balmer_nist_nm': balmer_info[1] if balmer_info is not None else np.nan,
+            'hydrogen_balmer_priority_boost': float(SPECTROSCOPY_BALMER_PRIORITY_BOOST) if is_balmer else 0.0,
             'nist_relative_intensity': nist_intensity,
             'nist_relative_intensity_numeric': nist_intensity_numeric,
             'source_file': source_file,
             'wavelength_source': lambda_source,
-            'matching_method': 'wavelength_window_normalized_rw_intensity_threshold',
+            'matching_method': 'feature_centroid_window_experimental_first',
+            'experimental_feature_id': feature.get('experimental_feature_id', np.nan),
+            'feature_center_nm': feature.get('feature_center_nm', np.nan),
+            'feature_peak_wavelength_nm': feature.get('feature_peak_wavelength_nm', np.nan),
+            'feature_start_nm': feature.get('feature_start_nm', np.nan),
+            'feature_end_nm': feature.get('feature_end_nm', np.nan),
+            'feature_width_nm': feature.get('feature_width_nm', np.nan),
+            'feature_n_points': feature.get('feature_n_points', np.nan),
         })
 
     if not rows:
         return pd.DataFrame()
 
     out = pd.DataFrame(rows)
-
-    # Avoid duplicated rows caused by several NIST lines falling inside one
-    # Avantes-resolution bin for the same element. Keep the line with the
-    # largest NIST relative intensity only. Wavelength proximity is kept only as
-    # a tie-breaker, not as part of the score.
-    bin_width = max(tolerance_nm / 2.0, 1e-9)
     out['abs_delta_nm'] = out['delta_nm'].abs()
-    out['experimental_peak_bin'] = np.round(out['experimental_wavelength_nm'] / bin_width).astype(int)
-
+    tol_for_score = pd.to_numeric(
+        out.get('match_tolerance_used_nm', tolerance_nm),
+        errors='coerce'
+    ).fillna(float(tolerance_nm)).astype(float).clip(lower=1e-12)
+    out['proximity_score'] = np.clip(
+        1.0 - out['abs_delta_nm'].astype(float) / tol_for_score,
+        0.0,
+        1.0,
+    )
     out['nist_intensity_for_score'] = pd.to_numeric(
         out.get('nist_relative_intensity_numeric', np.nan),
         errors='coerce'
     ).fillna(0.0)
+    out['nist_log_for_score'] = np.log10(out['nist_intensity_for_score'].clip(lower=0.0) + 1.0)
+    out['nist_score_norm'] = normalize_01(out['nist_log_for_score'])
+    out['experimental_score_norm'] = normalize_01(out['local_excess'])
+    out['element_prior_score'] = pd.to_numeric(
+        out.get('element_prior_score', 0.30), errors='coerce'
+    ).fillna(0.30).astype(float)
+    density = pd.to_numeric(out.get('nist_local_line_density', 1), errors='coerce').fillna(1.0).astype(float).clip(lower=1.0)
+    out['line_density_penalty_score'] = normalize_01(np.log1p(density))
+    balmer_boost = pd.to_numeric(
+        out.get('hydrogen_balmer_priority_boost', 0.0),
+        errors='coerce'
+    ).fillna(0.0).astype(float)
+    out['candidate_score'] = (
+        0.55 * out['proximity_score'].astype(float)
+        + 0.25 * out['experimental_score_norm'].astype(float)
+        + 0.08 * out['nist_score_norm'].astype(float)
+        + SPECTROSCOPY_ELEMENT_PRIOR_WEIGHT * out['element_prior_score'].astype(float)
+        + balmer_boost
+    )
 
-    out['candidate_score'] = out['nist_intensity_for_score'].astype(float)
-
+    # Deduplicate only within the same element/file/experimental feature. Keep
+    # the most plausible transition for that element. Cross-element alternatives
+    # are preserved and marked later as best/secondary candidates.
+    feature_key_col = 'experimental_feature_id'
     out = (
         out.sort_values(
-            ['shot', 'type of element', 'source_file', 'experimental_peak_bin', 'candidate_score', 'abs_delta_nm', 'intensity'],
+            ['shot', 'type of element', 'source_file', feature_key_col, 'candidate_score', 'abs_delta_nm', 'intensity'],
             ascending=[True, True, True, True, False, True, False]
         )
         .drop_duplicates(
-            subset=['shot', 'type of element', 'source_file', 'experimental_peak_bin'],
+            subset=['shot', 'type of element', 'source_file', feature_key_col],
             keep='first'
         )
+        .reset_index(drop=True)
     )
-
-    out = out.drop(columns=['experimental_peak_bin', 'nist_intensity_for_score'])
     return out
+
 
 # =========================================================
 # MODULAR TAB CLASS
@@ -2345,12 +2754,21 @@ class ShotComparisonTab:
         self.nist_min_relative_peak_height = NIST_MIN_RELATIVE_PEAK_HEIGHT
         self.nist_noise_sigma_factor = NIST_NOISE_SIGMA_FACTOR
         self.nist_last_matches = pd.DataFrame()
-        # Show/export only the first N globally assigned candidate lines per shot.
-        # The assignment is always computed with all local NIST files first;
-        # selected files only filter the already-assigned best candidates.
+        # Show/export only the first N experimental spectral features per shot.
+        # All local NIST files are matched first. Toggle selected only filters
+        # precomputed candidates; it does not recompute ownership after selection.
         self.nist_display_max_lines = 10
         self.nist_all_matches_cache = None
         self.nist_all_matches_cache_key = None
+        self.nist_all_candidates_cache = None
+
+        # Optional wavelength calibration from hydrogen Balmer lines. Coefficients
+        # are stored per loaded shot in data['spectroscopy_calibration_coefficients'].
+        self.spectroscopy_calibration_enabled = False
+        self.spectroscopy_calibration_degree = SPECTROSCOPY_CALIBRATION_DEFAULT_DEGREE
+        self.spectroscopy_calibration_window_nm = SPECTROSCOPY_CALIBRATION_SEARCH_WINDOW_NM
+        self.spectroscopy_last_calibration_table = pd.DataFrame()
+        self.nist_show_candidate_alternatives = False
 
         self.color_palette = [
             '#003f5c', '#7a5195', '#ef5675', '#ffa600', '#2f4b7c',
@@ -2982,31 +3400,71 @@ class ShotComparisonTab:
                 default_filename_base="nist_emission_line_options"
             )
 
-        def show_matches():
+        def show_best_matches():
             if not read_params():
                 return
-            df = self.compute_selected_spectroscopy_matches()
+            df = self.compute_spectroscopy_best_global_table()
             if df.empty:
                 messagebox.showinfo(
-                    "No matched lines",
-                    "No selected NIST lines had significant experimental intensity within the wavelength tolerance.\n"
+                    "No best matched lines",
+                    "No accepted global-best NIST lines were found for the selected elements/files.\n"
+                    "Try selecting more elements, increasing the tolerance, or reducing the intensity threshold."
+                )
+                return
+            self.show_dataframe_window(
+                df,
+                title="Best global spectroscopy matches",
+                default_filename_base="matched_spectroscopy_best_global",
+                plot_callback=self.show_matched_spectroscopy_figure
+            )
+
+        def show_candidate_matches():
+            if not read_params():
+                return
+            df = self.compute_spectroscopy_candidate_table()
+            if df.empty:
+                messagebox.showinfo(
+                    "No candidate lines",
+                    "No candidate NIST lines were found for the selected elements/files.\n"
                     "Try selecting an element, increasing the tolerance, or reducing the intensity threshold."
                 )
                 return
             self.show_dataframe_window(
                 df,
-                title="Matched spectroscopy lines",
-                default_filename_base="matched_spectroscopy_lines",
-                plot_callback=self.show_matched_spectroscopy_figure
+                title="All spectroscopy candidates by experimental feature",
+                default_filename_base="matched_spectroscopy_all_candidates"
             )
 
-        tk.Button(btn_frame, text="Toggle selected", command=toggle_selected).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Apply filter", command=apply_filter).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Clear filter", command=clear_filter).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Show available files", command=show_available_files).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Update max lines", command=lambda: (read_params() and self.plot_data())).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Show / export matched table", command=show_matches).pack(side=tk.RIGHT, padx=5)
-        tk.Button(btn_frame, text="Close", command=win.destroy).pack(side=tk.RIGHT, padx=5)
+        def run_gui_action(action):
+            try:
+                action()
+            except Exception as exc:
+                messagebox.showerror(
+                    "Spectroscopy tool error",
+                    f"The requested spectroscopy action failed:\n{exc}\n\n"
+                    "Check the terminal for the full traceback."
+                )
+                traceback.print_exc()
+
+        def update_displayed_line_limit():
+            if read_params():
+                self.plot_data()
+
+        def calibrate_now():
+            if read_params():
+                self.calibrate_spectroscopy_gui()
+
+        tk.Button(btn_frame, text="Toggle selected", command=lambda: run_gui_action(toggle_selected)).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Apply filter", command=lambda: run_gui_action(apply_filter)).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Clear filter", command=lambda: run_gui_action(clear_filter)).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Show available files", command=lambda: run_gui_action(show_available_files)).pack(side=tk.LEFT, padx=5)
+
+        # Max lines/shot shown controls the top-N experimental features shown per shot.
+        # Apply/redraw top N only refreshes the display after editing that number.
+        tk.Button(btn_frame, text="Apply/redraw top N", command=lambda: run_gui_action(update_displayed_line_limit)).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Calibrate spectroscopy", command=lambda: run_gui_action(calibrate_now)).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Show best global table", command=lambda: run_gui_action(show_best_matches)).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="Show all candidates table", command=lambda: run_gui_action(show_candidate_matches)).pack(side=tk.RIGHT, padx=5)
 
     def get_selected_nist_dataframes(self):
         """Return [(element_label, file_name, dataframe), ...] for selected NIST files."""
@@ -3067,37 +3525,227 @@ class ShotComparisonTab:
                 if str(x.get('file', '')).strip()
             )
         )
+        calibration_key = tuple(
+            (
+                str(d.get('shot_number', '')),
+                bool(d.get('spectroscopy_calibration_enabled', False)),
+                tuple(np.asarray(d.get('spectroscopy_calibration_coefficients', []), dtype=float).round(10))
+                if d.get('spectroscopy_calibration_coefficients', None) is not None else tuple(),
+            )
+            for d in self.processed_data
+        )
         return (
             shots,
             files,
             float(self.nist_match_tolerance_nm),
             float(self.nist_min_relative_peak_height),
             float(self.nist_noise_sigma_factor),
+            calibration_key,
         )
+
+    def apply_spectroscopy_calibration_to_wavelengths(self, data, wavelengths):
+        """Apply per-shot wavelength calibration when available and enabled."""
+        if not getattr(self, "spectroscopy_calibration_enabled", False):
+            return np.asarray(wavelengths, dtype=float)
+        if data is None or not data.get('spectroscopy_calibration_enabled', False):
+            return np.asarray(wavelengths, dtype=float)
+        return apply_wavelength_calibration(
+            wavelengths,
+            data.get('spectroscopy_calibration_coefficients', None)
+        )
+
+    def get_matching_spectrum_arrays(self, data):
+        """Return wavelength/intensity arrays used by the spectroscopy matcher."""
+        wl, intensity_norm, spec_meta = get_spectroscopy_rw_normalized_arrays(data)
+        wl = self.apply_spectroscopy_calibration_to_wavelengths(data, wl)
+        if getattr(self, "spectroscopy_calibration_enabled", False) and data.get('spectroscopy_calibration_enabled', False):
+            spec_meta = dict(spec_meta)
+            spec_meta["wavelength_calibration"] = data.get("spectroscopy_calibration_label", "enabled")
+        return wl, intensity_norm, spec_meta
+
+    def estimate_hydrogen_balmer_calibration_for_data(self, data, degree=2, search_window_nm=SPECTROSCOPY_CALIBRATION_SEARCH_WINDOW_NM):
+        """
+        Estimate a wavelength calibration using visible H Balmer lines.
+
+        It searches local centroids around H_alpha, H_beta, H_gamma, etc. in the
+        uncalibrated experimental spectrum and fits:
+            lambda_NIST = poly(lambda_measured)
+        """
+        wl_raw, intensity_norm, spec_meta = get_spectroscopy_rw_normalized_arrays(data)
+        wl_raw = np.asarray(wl_raw, dtype=float)
+        intensity_norm = np.asarray(intensity_norm, dtype=float)
+
+        if wl_raw.size < 3 or intensity_norm.size < 3 or wl_raw.shape != intensity_norm.shape:
+            return pd.DataFrame(), None
+
+        finite = np.isfinite(wl_raw) & np.isfinite(intensity_norm)
+        wl_raw = wl_raw[finite]
+        intensity_norm = intensity_norm[finite]
+        if wl_raw.size < 3:
+            return pd.DataFrame(), None
+
+        baseline, sigma = robust_noise_level(intensity_norm)
+        y_max = float(np.nanmax(intensity_norm))
+        min_excess = max(
+            self.nist_noise_sigma_factor * sigma,
+            self.nist_min_relative_peak_height * y_max
+        )
+
+        rows = []
+        for line_name, lambda_nist in HYDROGEN_BALMER_LINES_NM:
+            if lambda_nist < np.nanmin(wl_raw) or lambda_nist > np.nanmax(wl_raw):
+                continue
+
+            local = estimate_local_spectral_center(
+                wl_raw,
+                intensity_norm,
+                lambda_nist,
+                window_nm=search_window_nm,
+                background_window_nm=max(2.5 * search_window_nm, NIST_LOCAL_BACKGROUND_WINDOW_NM),
+            )
+            if local is None:
+                continue
+
+            if local["local_excess"] < min_excess:
+                continue
+
+            measured = float(local["center_nm"])
+            rows.append({
+                "shot": data.get("shot_number", ""),
+                "line": line_name,
+                "lambda_nist_nm": float(lambda_nist),
+                "lambda_measured_nm": measured,
+                "raw_delta_measured_minus_nist_nm": measured - float(lambda_nist),
+                "peak_wavelength_nm": float(local["peak_wavelength_nm"]),
+                "peak_intensity": float(local["peak_intensity"]),
+                "local_excess": float(local["local_excess"]),
+                "n_points_in_window": int(local["n_points_in_window"]),
+            })
+
+        cal_df = pd.DataFrame(rows)
+        if cal_df.empty or len(cal_df) < 2:
+            return cal_df, None
+
+        degree_eff = int(min(max(int(degree), 1), len(cal_df) - 1, 2))
+        coeffs = np.polyfit(
+            cal_df["lambda_measured_nm"].to_numpy(dtype=float),
+            cal_df["lambda_nist_nm"].to_numpy(dtype=float),
+            deg=degree_eff,
+        )
+        cal_df["calibration_degree"] = degree_eff
+        cal_df["lambda_calibrated_nm"] = np.polyval(coeffs, cal_df["lambda_measured_nm"].to_numpy(dtype=float))
+        cal_df["residual_after_calibration_nm"] = cal_df["lambda_nist_nm"] - cal_df["lambda_calibrated_nm"]
+        cal_df["calibration_coefficients_high_to_low"] = ", ".join(f"{c:.12g}" for c in coeffs)
+        return cal_df, coeffs
+
+    def calibrate_spectroscopy_gui(self):
+        """Button callback: calibrate spectra using H Balmer lines."""
+        if not self.processed_data:
+            messagebox.showinfo("No shots", "Load at least one shot before calibrating spectroscopy.")
+            return
+
+        degree = simpledialog.askinteger(
+            "Spectroscopy calibration",
+            "Polynomial degree for wavelength calibration (1 = linear, 2 = quadratic):",
+            initialvalue=int(getattr(self, "spectroscopy_calibration_degree", 2)),
+            minvalue=1,
+            maxvalue=2,
+            parent=self.app
+        )
+        if degree is None:
+            return
+
+        window_nm = simpledialog.askfloat(
+            "Spectroscopy calibration",
+            "Search half-window around each H Balmer line [nm] (recommended: 1.5):",
+            initialvalue=float(getattr(self, "spectroscopy_calibration_window_nm", SPECTROSCOPY_CALIBRATION_SEARCH_WINDOW_NM)),
+            minvalue=0.2,
+            maxvalue=10.0,
+            parent=self.app
+        )
+        if window_nm is None:
+            return
+
+        self.spectroscopy_calibration_degree = int(degree)
+        self.spectroscopy_calibration_window_nm = float(window_nm)
+
+        all_rows = []
+        calibrated_count = 0
+        for data in self.processed_data:
+            cal_df, coeffs = self.estimate_hydrogen_balmer_calibration_for_data(
+                data,
+                degree=degree,
+                search_window_nm=window_nm,
+            )
+            if cal_df is not None and not cal_df.empty:
+                all_rows.append(cal_df)
+
+            if coeffs is not None and len(coeffs) >= 2:
+                data['spectroscopy_calibration_coefficients'] = [float(c) for c in coeffs]
+                data['spectroscopy_calibration_enabled'] = True
+                data['spectroscopy_calibration_label'] = (
+                    f"H Balmer polynomial degree {min(int(degree), len(coeffs)-1)}"
+                )
+                data['spectroscopy_calibration_anchors'] = cal_df.to_dict(orient="records")
+                calibrated_count += 1
+            else:
+                data['spectroscopy_calibration_coefficients'] = None
+                data['spectroscopy_calibration_enabled'] = False
+                data['spectroscopy_calibration_label'] = "not enough H lines"
+                data['spectroscopy_calibration_anchors'] = []
+
+        self.spectroscopy_calibration_enabled = calibrated_count > 0
+        self.nist_all_matches_cache = None
+        self.nist_all_matches_cache_key = None
+        self.nist_all_candidates_cache = None
+
+        if all_rows:
+            result_df = pd.concat(all_rows, ignore_index=True)
+        else:
+            result_df = pd.DataFrame()
+        self.spectroscopy_last_calibration_table = result_df
+
+        if result_df.empty:
+            messagebox.showwarning(
+                "Spectroscopy calibration",
+                "No usable H Balmer lines were found. Calibration was not applied."
+            )
+            return
+
+        messagebox.showinfo(
+            "Spectroscopy calibration",
+            f"Calibration applied to {calibrated_count} shot(s).\n"
+            "The NIST filter will now use the calibrated wavelength axis."
+        )
+        self.show_dataframe_window(
+            result_df,
+            title="Spectroscopy calibration from H Balmer lines",
+            default_filename_base="spectroscopy_hydrogen_calibration"
+        )
+        self.plot_data()
 
     def compute_all_spectroscopy_matches(self):
         """
-        Compute the globally assigned matched-line table using ALL local NIST files.
+        Compute candidate matched-line table using ALL local NIST files.
 
-        Important behavior:
-          1) all local element files are matched first;
-          2) for each experimental wavelength bin, only the best candidate is kept;
-          3) GUI selection is NOT used here.
+        Final accepted/global-best rows are chosen with an instrument-resolution
+        exclusion rule:
 
-        This prevents recalculating assignments after Toggle selected. Selection later
-        only filters the already-computed candidate table.
+          1) H Balmer lines used in calibration are accepted first as anchors.
+          2) Each accepted line blocks +/- 0.6 nm around its NIST wavelength.
+          3) Remaining candidates are considered by candidate_score. Once a
+             candidate is accepted, it also blocks +/- 0.6 nm.
+          4) The diagnostic candidate table still keeps all candidates, including
+             suppressed/blocked rows.
+
+        This gives a clean global ranking table while preserving all alternatives
+        for inspection.
         """
         base_cols = [
-            "shot",
-            "type of element",
-            "wavelength",
-            "intensity",
-            "rank_in_shot",
-            "experimental_wavelength_nm",
-            "delta_nm",
-            "relative_intensity_in_shot",
-            "spectrum_source",
-            "spectrum_normalization",
+            "shot", "type of element", "wavelength", "intensity", "rank_in_shot",
+            "experimental_wavelength_nm", "delta_nm", "relative_intensity_in_shot",
+            "candidate_score", "proximity_score", "is_global_best",
+            "spectrum_source", "spectrum_normalization",
         ]
 
         if not self.processed_data:
@@ -3114,17 +3762,25 @@ class ShotComparisonTab:
         if not all_nist:
             return pd.DataFrame(columns=base_cols)
 
+        # First available H NIST file. Synthetic calibration-anchor rows use this
+        # source file so they remain visible when the user selects H in the filter.
+        hydrogen_source_file = ""
+        for _el, _file, _df in all_nist:
+            if normalize_element_label(_el) == "H":
+                hydrogen_source_file = _file
+                break
+
         shot_tables = []
+        exclusion_half_width_nm = float(SPECTROSCOPY_ACCEPTED_LINE_EXCLUSION_HALF_WIDTH_NM)
 
         for shot_order, data in enumerate(self.processed_data):
-            wl, intensity_norm, spec_meta = get_spectroscopy_rw_normalized_arrays(data)
+            wl_raw_for_match, _, _ = get_spectroscopy_rw_normalized_arrays(data)
+            wl, intensity_norm, spec_meta = self.get_matching_spectrum_arrays(data)
             shot = data.get('shot_number', '')
-
             if len(wl) == 0 or len(intensity_norm) == 0:
                 continue
 
             rows_for_shot = []
-
             for element_label, file_name, nist_df in all_nist:
                 matched = match_nist_lines_for_shot(
                     wl,
@@ -3132,6 +3788,7 @@ class ShotComparisonTab:
                     nist_df,
                     element_label=element_label,
                     shot_number=shot,
+                    wavelengths_raw=wl_raw_for_match,
                     tolerance_nm=self.nist_match_tolerance_nm,
                     min_relative_peak_height=self.nist_min_relative_peak_height,
                     noise_sigma_factor=self.nist_noise_sigma_factor,
@@ -3144,57 +3801,555 @@ class ShotComparisonTab:
                     matched["spectrum_normalization_factor"] = spec_meta.get("spectrum_normalization_factor", np.nan)
                     matched["plasma_duration_s_for_spectrum"] = spec_meta.get("plasma_duration_s_for_spectrum", np.nan)
                     matched["Ip_integral_plasma_tau_positive_A_for_spectrum"] = spec_meta.get(
-                        "Ip_integral_plasma_tau_positive_A_for_spectrum",
-                        np.nan
+                        "Ip_integral_plasma_tau_positive_A_for_spectrum", np.nan
                     )
                     matched["Ip_integral_plasma_time_positive_C_for_spectrum"] = spec_meta.get(
-                        "Ip_integral_plasma_time_positive_C_for_spectrum",
-                        np.nan
+                        "Ip_integral_plasma_time_positive_C_for_spectrum", np.nan
                     )
+                    matched["wavelength_calibration"] = spec_meta.get("wavelength_calibration", "none")
+                    _halpha_support = get_halpha_temporal_support_metrics(data)
+                    for _hk, _hv in _halpha_support.items():
+                        matched[_hk] = _hv
+
+                    if SPECTROSCOPY_USE_HALPHA_TEMPORAL_SUPPORT_FILTER and "is_hydrogen_balmer" in matched.columns:
+                        _hmean = _halpha_support.get("halpha_temporal_mean_real_window", np.nan)
+                        if (not np.isfinite(_hmean)) or (_hmean < SPECTROSCOPY_HALPHA_TEMPORAL_MIN_MEAN):
+                            matched = matched[~matched["is_hydrogen_balmer"].astype(bool)].copy()
+
                     matched["shot_order"] = shot_order
                     rows_for_shot.append(matched)
 
             if not rows_for_shot:
                 continue
 
-            shot_df = pd.concat(rows_for_shot, ignore_index=True)
-            shot_df["abs_delta_nm"] = shot_df["delta_nm"].abs()
+            shot_df = pd.concat(rows_for_shot, ignore_index=True).reset_index(drop=True)
+            shot_df["_candidate_row_id"] = np.arange(len(shot_df), dtype=int)
+            shot_df["abs_delta_nm"] = pd.to_numeric(shot_df["delta_nm"], errors="coerce").abs()
 
-            bin_width = max(self.nist_match_tolerance_nm / 2.0, 1e-9)
-            shot_df["experimental_peak_bin_global"] = np.round(
-                shot_df["experimental_wavelength_nm"].astype(float) / bin_width
-            ).astype(int)
+            # Robust feature key: prefer the experimental feature id; fallback to a
+            # wavelength bin if an old/empty candidate table lacks that column.
+            if "experimental_feature_id" in shot_df.columns:
+                shot_df["experimental_feature_id_global"] = pd.to_numeric(
+                    shot_df["experimental_feature_id"], errors="coerce"
+                ).fillna(-1).astype(int)
+            else:
+                bin_width = max(self.nist_match_tolerance_nm / 2.0, 1e-9)
+                shot_df["experimental_feature_id_global"] = np.round(
+                    shot_df["experimental_wavelength_nm"].astype(float) / bin_width
+                ).astype(int)
+
+            def _bool_series(df, col, default=False):
+                if col in df.columns:
+                    return df[col].fillna(default).astype(bool)
+                return pd.Series(default, index=df.index, dtype=bool)
+
+            def _str_series(df, col, default=""):
+                if col in df.columns:
+                    return df[col].fillna(default).astype(str)
+                return pd.Series(default, index=df.index, dtype=str)
+
+            def _num_series(df, col, default=np.nan):
+                if col in df.columns:
+                    return pd.to_numeric(df[col], errors="coerce")
+                return pd.Series(default, index=df.index, dtype=float)
+
+            # Calibration anchors:
+            # If H_alpha, H_beta, etc. were used to calibrate the spectrum, they
+            # are forced into the accepted-line table before any other element.
+            # This avoids the inconsistency:
+            #   "use H_alpha for calibration, but later assign that same region to O/Fe".
+            #
+            # Important: the anchor can be an existing H candidate row, or, if the
+            # 0.6 nm matching window failed to create an H row, a synthetic H-anchor
+            # row is added from the calibration table. The diagnostic candidates
+            # table still keeps all Fe/O/W/N alternatives.
+            shot_df["is_calibration_anchor"] = False
+            shot_df["calibration_anchor_line"] = ""
+            shot_df["calibration_anchor_nist_nm"] = np.nan
+            shot_df["is_synthetic_calibration_anchor"] = False
+            anchors = data.get("spectroscopy_calibration_anchors", []) if isinstance(data, dict) else []
+
+            def _get_anchor_value(anchor, keys, default=np.nan):
+                for key in keys:
+                    if key in anchor:
+                        val = anchor.get(key)
+                        if isinstance(default, str):
+                            if val is not None and str(val) != "":
+                                return str(val)
+                        else:
+                            try:
+                                fval = float(val)
+                                if np.isfinite(fval):
+                                    return fval
+                            except Exception:
+                                pass
+                return default
+
+            def _make_synthetic_anchor_row(anchor_index, anchor_line, anchor_nist, anchor_measured, anchor_calibrated, anchor_peak, anchor_intensity):
+                # Feature id is intentionally negative so it cannot collide with
+                # real detected experimental feature ids.
+                synthetic_feature_id = -100000 - 1000 * int(shot_order) - int(anchor_index)
+
+                if not np.isfinite(anchor_calibrated):
+                    coeffs = data.get("spectroscopy_calibration_coefficients", None)
+                    if coeffs is not None and np.isfinite(anchor_measured):
+                        try:
+                            anchor_calibrated = float(np.polyval(np.asarray(coeffs, dtype=float), anchor_measured))
+                        except Exception:
+                            anchor_calibrated = anchor_nist
+
+                if not np.isfinite(anchor_calibrated):
+                    anchor_calibrated = anchor_nist
+                if not np.isfinite(anchor_measured):
+                    anchor_measured = anchor_calibrated
+                if not np.isfinite(anchor_peak):
+                    anchor_peak = anchor_measured
+                if not np.isfinite(anchor_intensity):
+                    # Fall back to the strongest local experimental point around the
+                    # measured anchor if possible.
+                    try:
+                        local = estimate_local_spectral_center(
+                            wl_raw_for_match,
+                            intensity_norm,
+                            anchor_measured,
+                            window_nm=max(exclusion_half_width_nm, 0.60),
+                            background_window_nm=NIST_LOCAL_BACKGROUND_WINDOW_NM,
+                        )
+                        if local is not None:
+                            anchor_intensity = float(local.get("peak_intensity", np.nan))
+                    except Exception:
+                        pass
+                if not np.isfinite(anchor_intensity):
+                    anchor_intensity = float(np.nanmax(intensity_norm)) if len(intensity_norm) else np.nan
+
+                delta = float(anchor_calibrated - anchor_nist)
+                abs_delta = abs(delta)
+                y_max_local = float(np.nanmax(intensity_norm)) if len(intensity_norm) else np.nan
+                rel_intensity = anchor_intensity / y_max_local if np.isfinite(y_max_local) and y_max_local > 0 else np.nan
+                prox = max(0.0, 1.0 - abs_delta / max(exclusion_half_width_nm, 1e-12))
+
+                balmer_info = get_hydrogen_balmer_match(anchor_nist, tolerance_nm=0.15)
+                anchor_row = {
+                    "shot": shot,
+                    "type of element": "H",
+                    "wavelength": float(anchor_nist),
+                    "intensity": float(anchor_intensity),
+                    "experimental_wavelength_nm": float(anchor_calibrated),
+                    "experimental_raw_wavelength_nm": float(anchor_measured),
+                    "experimental_calibrated_wavelength_nm": float(anchor_calibrated),
+                    "experimental_peak_wavelength_nm": float(anchor_calibrated),
+                    "experimental_raw_peak_wavelength_nm": float(anchor_peak),
+                    "delta_nm": delta,
+                    "relative_intensity_in_shot": rel_intensity,
+                    "local_background": np.nan,
+                    "local_excess": float(anchor_intensity),
+                    "local_mean_intensity": float(anchor_intensity),
+                    "local_integrated_intensity": np.nan,
+                    "n_points_in_matching_window": np.nan,
+                    "matching_window_width_nm": np.nan,
+                    "match_tolerance_used_nm": float(exclusion_half_width_nm),
+                    "nist_local_line_density": 1,
+                    "element_prior_score": get_element_prior_score("H"),
+                    "is_hydrogen_balmer": True,
+                    "hydrogen_balmer_name": anchor_line,
+                    "hydrogen_balmer_nist_nm": float(anchor_nist),
+                    "hydrogen_balmer_priority_boost": float(SPECTROSCOPY_BALMER_PRIORITY_BOOST),
+                    "nist_relative_intensity": "",
+                    "nist_relative_intensity_numeric": np.nan,
+                    "source_file": hydrogen_source_file if hydrogen_source_file else "calibration_anchor_H",
+                    "wavelength_source": "H_Balmer_reference",
+                    "matching_method": "forced_calibration_anchor",
+                    "experimental_feature_id": synthetic_feature_id,
+                    "experimental_feature_id_global": synthetic_feature_id,
+                    "feature_center_nm": float(anchor_calibrated),
+                    "feature_peak_wavelength_nm": float(anchor_calibrated),
+                    "feature_start_nm": float(anchor_calibrated) - float(exclusion_half_width_nm),
+                    "feature_end_nm": float(anchor_calibrated) + float(exclusion_half_width_nm),
+                    "feature_width_nm": 2.0 * float(exclusion_half_width_nm),
+                    "feature_n_points": np.nan,
+                    "spectrum_source": spec_meta.get("spectrum_source", ""),
+                    "spectrum_normalization": "S_rw / (plasma_duration_s * Ip_integral_plasma_tau_A)",
+                    "spectrum_normalization_factor": spec_meta.get("spectrum_normalization_factor", np.nan),
+                    "plasma_duration_s_for_spectrum": spec_meta.get("plasma_duration_s_for_spectrum", np.nan),
+                    "Ip_integral_plasma_tau_positive_A_for_spectrum": spec_meta.get("Ip_integral_plasma_tau_positive_A_for_spectrum", np.nan),
+                    "Ip_integral_plasma_time_positive_C_for_spectrum": spec_meta.get("Ip_integral_plasma_time_positive_C_for_spectrum", np.nan),
+                    "wavelength_calibration": spec_meta.get("wavelength_calibration", "none"),
+                    "shot_order": shot_order,
+                    "abs_delta_nm": abs_delta,
+                    "proximity_score": prox,
+                    "experimental_score_norm": 1.0,
+                    "nist_score_norm": 0.0,
+                    "line_density_penalty_score": 0.0,
+                    "candidate_score": 10.0 + float(SPECTROSCOPY_BALMER_PRIORITY_BOOST),
+                    "is_calibration_anchor": True,
+                    "calibration_anchor_line": anchor_line,
+                    "calibration_anchor_nist_nm": float(anchor_nist),
+                    "is_synthetic_calibration_anchor": True,
+                }
+                _halpha_support = get_halpha_temporal_support_metrics(data)
+                for _hk, _hv in _halpha_support.items():
+                    anchor_row[_hk] = _hv
+                return anchor_row
+
+            synthetic_anchor_rows = []
+
+            for anchor_index, anchor in enumerate(anchors or []):
+                anchor_line = _get_anchor_value(
+                    anchor,
+                    ["line", "hydrogen_balmer_name", "calibration_anchor_line"],
+                    default=""
+                )
+                anchor_nist = _get_anchor_value(
+                    anchor,
+                    ["lambda_nist_nm", "hydrogen_balmer_nist_nm", "calibration_anchor_nist_nm"],
+                    default=np.nan
+                )
+                anchor_measured = _get_anchor_value(
+                    anchor,
+                    ["lambda_measured_nm", "experimental_raw_wavelength_nm", "measured_wavelength_nm"],
+                    default=np.nan
+                )
+                anchor_calibrated = _get_anchor_value(
+                    anchor,
+                    ["lambda_calibrated_nm", "experimental_calibrated_wavelength_nm", "experimental_wavelength_nm"],
+                    default=np.nan
+                )
+                anchor_peak = _get_anchor_value(
+                    anchor,
+                    ["peak_wavelength_nm", "experimental_raw_peak_wavelength_nm"],
+                    default=np.nan
+                )
+                anchor_intensity = _get_anchor_value(
+                    anchor,
+                    ["peak_intensity", "intensity"],
+                    default=np.nan
+                )
+
+                if not anchor_line or not np.isfinite(anchor_nist):
+                    continue
+
+                # First try to mark an existing H Balmer candidate.
+                mask_anchor = (
+                    _bool_series(shot_df, "is_hydrogen_balmer")
+                    & _str_series(shot_df, "hydrogen_balmer_name").eq(anchor_line)
+                    & (_num_series(shot_df, "wavelength").sub(anchor_nist).abs() <= 0.15)
+                )
+
+                if mask_anchor.any():
+                    candidates_for_anchor = shot_df.loc[mask_anchor].copy()
+                    if np.isfinite(anchor_measured) and "experimental_raw_wavelength_nm" in candidates_for_anchor.columns:
+                        candidates_for_anchor["_anchor_raw_distance"] = (
+                            pd.to_numeric(candidates_for_anchor["experimental_raw_wavelength_nm"], errors="coerce")
+                            .sub(anchor_measured)
+                            .abs()
+                        )
+                    else:
+                        candidates_for_anchor["_anchor_raw_distance"] = 0.0
+
+                    candidates_for_anchor["_anchor_delta"] = pd.to_numeric(
+                        candidates_for_anchor.get("delta_nm", np.nan), errors="coerce"
+                    ).abs()
+
+                    chosen_idx = candidates_for_anchor.sort_values(
+                        ["_anchor_raw_distance", "_anchor_delta", "candidate_score", "intensity"],
+                        ascending=[True, True, False, False]
+                    ).index[0]
+
+                    feature_id = int(shot_df.loc[chosen_idx, "experimental_feature_id_global"])
+                    feature_mask = shot_df["experimental_feature_id_global"].astype(int).eq(feature_id)
+                    shot_df.loc[feature_mask, "calibration_anchor_line"] = anchor_line
+                    shot_df.loc[feature_mask, "calibration_anchor_nist_nm"] = anchor_nist
+                    shot_df.loc[chosen_idx, "is_calibration_anchor"] = True
+                    shot_df.loc[chosen_idx, "is_synthetic_calibration_anchor"] = False
+                else:
+                    # If no row exists because the 0.6 nm candidate window was too
+                    # strict, keep the calibration anchor anyway.
+                    synthetic_anchor_rows.append(
+                        _make_synthetic_anchor_row(
+                            anchor_index,
+                            anchor_line,
+                            anchor_nist,
+                            anchor_measured,
+                            anchor_calibrated,
+                            anchor_peak,
+                            anchor_intensity,
+                        )
+                    )
+
+            if synthetic_anchor_rows:
+                synthetic_df = pd.DataFrame(synthetic_anchor_rows)
+                next_id = int(shot_df["_candidate_row_id"].max()) + 1 if "_candidate_row_id" in shot_df.columns and len(shot_df) else 0
+                synthetic_df["_candidate_row_id"] = np.arange(next_id, next_id + len(synthetic_df), dtype=int)
+                # Ensure all missing columns exist before concatenation.
+                for col in shot_df.columns:
+                    if col not in synthetic_df.columns:
+                        synthetic_df[col] = np.nan
+                for col in synthetic_df.columns:
+                    if col not in shot_df.columns:
+                        shot_df[col] = np.nan
+                shot_df = pd.concat([shot_df, synthetic_df[shot_df.columns]], ignore_index=True)
+                shot_df["abs_delta_nm"] = pd.to_numeric(shot_df["delta_nm"], errors="coerce").abs()
+
+            # Recompute cross-element score. No density penalty is applied: dense
+            # Fe spectra are not suppressed; they only compete by wavelength, signal
+            # strength, NIST weak prior, and physical element prior.
+            tol_for_score = pd.to_numeric(
+                shot_df.get("match_tolerance_used_nm", self.nist_match_tolerance_nm),
+                errors="coerce"
+            ).fillna(float(self.nist_match_tolerance_nm)).astype(float).clip(lower=1e-12)
+            shot_df["proximity_score"] = np.clip(
+                1.0 - shot_df["abs_delta_nm"].astype(float) / tol_for_score,
+                0.0, 1.0
+            )
+            if "local_excess" in shot_df.columns:
+                shot_df["experimental_score_norm"] = normalize_01(shot_df["local_excess"])
+            else:
+                shot_df["experimental_score_norm"] = normalize_01(shot_df["intensity"])
 
             shot_df["nist_intensity_for_score"] = pd.to_numeric(
-                shot_df.get("nist_relative_intensity_numeric", np.nan),
-                errors="coerce"
+                shot_df.get("nist_relative_intensity_numeric", np.nan), errors="coerce"
             ).fillna(0.0)
+            shot_df["nist_log_for_score"] = np.log10(shot_df["nist_intensity_for_score"].clip(lower=0.0) + 1.0)
+            shot_df["nist_score_norm"] = normalize_01(shot_df["nist_log_for_score"])
+            shot_df["element_prior_score"] = pd.to_numeric(
+                shot_df.get("element_prior_score", 0.30), errors="coerce"
+            ).fillna(0.30).astype(float)
+            density = pd.to_numeric(shot_df.get("nist_local_line_density", 1), errors="coerce").fillna(1.0).astype(float).clip(lower=1.0)
+            shot_df["line_density_penalty_score"] = 0.0 * normalize_01(np.log1p(density))
+            balmer_boost = pd.to_numeric(
+                shot_df.get("hydrogen_balmer_priority_boost", 0.0),
+                errors="coerce"
+            ).fillna(0.0).astype(float)
+            anchor_boost = pd.Series(0.0, index=shot_df.index)
+            if "is_calibration_anchor" in shot_df.columns:
+                anchor_boost = shot_df["is_calibration_anchor"].astype(bool).astype(float) * 2.0
 
-            # Choose the best candidate for each measured wavelength bin from ALL
-            # elements. A selected-only Fe table cannot steal H-alpha afterwards.
-            shot_df["candidate_score"] = shot_df["nist_intensity_for_score"].astype(float)
-            shot_df["proximity_score"] = np.clip(
-                1.0 - shot_df["abs_delta_nm"].astype(float) / max(self.nist_match_tolerance_nm, 1e-12),
-                0.0,
-                1.0
+            shot_df["candidate_score"] = (
+                0.55 * shot_df["proximity_score"].astype(float)
+                + 0.25 * shot_df["experimental_score_norm"].astype(float)
+                + 0.08 * shot_df["nist_score_norm"].astype(float)
+                + SPECTROSCOPY_ELEMENT_PRIOR_WEIGHT * shot_df["element_prior_score"].astype(float)
+                + balmer_boost
+                + anchor_boost
             )
-            shot_df["nist_score_norm"] = shot_df["candidate_score"]
 
-            shot_df = (
-                shot_df
-                .sort_values(
-                    ["experimental_peak_bin_global", "candidate_score", "abs_delta_nm", "intensity"],
-                    ascending=[True, False, True, False]
-                )
-                .drop_duplicates(
-                    subset=["shot", "experimental_peak_bin_global"],
-                    keep="first"
-                )
+            # Feature intensity rank for diagnostic candidate table. This is
+            # independent of the accepted-line exclusion algorithm.
+            feature_intensity = (
+                shot_df.groupby(["shot", "experimental_feature_id_global"], dropna=False)["intensity"]
+                .max()
+                .reset_index()
+                .sort_values(["shot", "intensity"], ascending=[True, False])
             )
+            feature_intensity["feature_rank_in_shot"] = feature_intensity.groupby("shot").cumcount() + 1
+            feature_rank_all = {
+                (r["shot"], r["experimental_feature_id_global"]): int(r["feature_rank_in_shot"])
+                for _, r in feature_intensity.iterrows()
+            }
+            shot_df["feature_rank_in_shot"] = [
+                feature_rank_all.get((r["shot"], r["experimental_feature_id_global"]), np.nan)
+                for _, r in shot_df.iterrows()
+            ]
 
-            # Rank within each shot after global assignment.
-            shot_df = shot_df.sort_values("intensity", ascending=False).reset_index(drop=True)
-            shot_df["rank_in_shot"] = np.arange(1, len(shot_df) + 1)
+            # Greedy accepted-line selection with +/-0.6 nm exclusion.
+            accepted_ids = []
+            accepted_features = set()
+            blocked_windows = []  # list of dict(center, half_width, element, row_id, reason)
+
+            shot_df["is_suppressed_by_exclusion_window"] = False
+            shot_df["suppression_reason"] = ""
+            shot_df["suppressed_by_element"] = ""
+            shot_df["suppressed_by_wavelength_nm"] = np.nan
+            shot_df["accepted_exclusion_half_width_nm"] = exclusion_half_width_nm
+
+            def _row_wavelength(row):
+                try:
+                    return float(row.get("wavelength", np.nan))
+                except Exception:
+                    return np.nan
+
+            def _feature_key(row):
+                return (row.get("shot", None), row.get("experimental_feature_id_global", None))
+
+            def _blocking_window_for(row, reason):
+                return {
+                    "center_nm": _row_wavelength(row),
+                    "half_width_nm": exclusion_half_width_nm,
+                    "element": str(row.get("type of element", "")),
+                    "row_id": int(row.get("_candidate_row_id", -1)),
+                    "reason": reason,
+                }
+
+            def _find_blocking_window(row):
+                lam = _row_wavelength(row)
+                if not np.isfinite(lam):
+                    return None
+                for win in blocked_windows:
+                    c = float(win.get("center_nm", np.nan))
+                    hw = float(win.get("half_width_nm", exclusion_half_width_nm))
+                    if np.isfinite(c) and abs(lam - c) <= hw:
+                        return win
+                return None
+
+            def _accept_row(row, reason):
+                row_id = int(row.get("_candidate_row_id"))
+                feature_key = _feature_key(row)
+                if row_id in accepted_ids or feature_key in accepted_features:
+                    return False
+                accepted_ids.append(row_id)
+                accepted_features.add(feature_key)
+                blocked_windows.append(_blocking_window_for(row, reason))
+                return True
+
+            # 1) Accept H calibration anchors first.
+            anchors_df = shot_df[shot_df["is_calibration_anchor"].astype(bool)].copy()
+            if not anchors_df.empty:
+                anchors_df["_anchor_line_sort"] = anchors_df.get("calibration_anchor_line", "").astype(str)
+                anchors_df = anchors_df.sort_values(
+                    ["_anchor_line_sort", "candidate_score", "proximity_score", "abs_delta_nm", "intensity"],
+                    ascending=[True, False, False, True, False]
+                )
+                for _, row in anchors_df.iterrows():
+                    block = _find_blocking_window(row)
+                    if block is None:
+                        _accept_row(row, "accepted_H_calibration_anchor")
+
+            # 2) Accept remaining candidates by score, while respecting both
+            # the spectral exclusion window and the one-candidate-per-feature rule.
+            remaining = shot_df[~shot_df["_candidate_row_id"].isin(accepted_ids)].copy()
+            if not remaining.empty:
+                remaining = remaining.sort_values(
+                    ["candidate_score", "proximity_score", "intensity", "abs_delta_nm"],
+                    ascending=[False, False, False, True]
+                )
+                for _, row in remaining.iterrows():
+                    row_id = int(row.get("_candidate_row_id"))
+                    feature_key = _feature_key(row)
+                    if row_id in accepted_ids or feature_key in accepted_features:
+                        continue
+
+                    block = _find_blocking_window(row)
+                    if block is not None:
+                        # Mark every candidate inside a blocked spectral interval.
+                        lam = _row_wavelength(row)
+                        if np.isfinite(lam):
+                            in_block = pd.to_numeric(shot_df["wavelength"], errors="coerce").sub(float(block["center_nm"])).abs() <= float(block["half_width_nm"])
+                            shot_df.loc[in_block & ~shot_df["_candidate_row_id"].isin(accepted_ids), "is_suppressed_by_exclusion_window"] = True
+                            shot_df.loc[in_block & ~shot_df["_candidate_row_id"].isin(accepted_ids), "suppression_reason"] = (
+                                "inside_accepted_line_window"
+                            )
+                            shot_df.loc[in_block & ~shot_df["_candidate_row_id"].isin(accepted_ids), "suppressed_by_element"] = block.get("element", "")
+                            shot_df.loc[in_block & ~shot_df["_candidate_row_id"].isin(accepted_ids), "suppressed_by_wavelength_nm"] = block.get("center_nm", np.nan)
+                        continue
+
+                    _accept_row(row, "accepted_global_candidate")
+
+            accepted_set = set(accepted_ids)
+            shot_df["is_global_best"] = shot_df["_candidate_row_id"].isin(accepted_set)
+
+            best = shot_df[shot_df["is_global_best"].astype(bool)].copy()
+
+            # Accepted global ranking by experimental intensity.
+            # Calibration anchors are placed first only when intensities are tied
+            # or nearly tied, so H_alpha/H_beta used for calibration cannot be
+            # pushed below an equally intense O/Fe candidate.
+            if not best.empty:
+                best["_rank_anchor_sort"] = (
+                    best["is_calibration_anchor"].astype(bool).astype(int)
+                    if "is_calibration_anchor" in best.columns else 0
+                )
+                feature_rank_df = best.sort_values(
+                    ["intensity", "_rank_anchor_sort", "candidate_score", "proximity_score"],
+                    ascending=[False, False, False, False]
+                ).drop(columns=["_rank_anchor_sort"], errors="ignore").reset_index(drop=True)
+                accepted_rank_map = {
+                    int(row["_candidate_row_id"]): i + 1
+                    for i, row in feature_rank_df.iterrows()
+                }
+                accepted_feature_rank_map = {
+                    (row["shot"], row["experimental_feature_id_global"]): i + 1
+                    for i, row in feature_rank_df.iterrows()
+                }
+            else:
+                feature_rank_df = pd.DataFrame()
+                accepted_rank_map = {}
+                accepted_feature_rank_map = {}
+
+            shot_df["rank_in_shot"] = [
+                accepted_feature_rank_map.get((r["shot"], r["experimental_feature_id_global"]), np.nan)
+                for _, r in shot_df.iterrows()
+            ]
+            shot_df["accepted_line_rank_in_shot"] = [
+                accepted_rank_map.get(int(r["_candidate_row_id"]), np.nan)
+                for _, r in shot_df.iterrows()
+            ]
+
+            # Per-feature best/second diagnostics. Use the accepted row when the
+            # feature is accepted. Otherwise keep the best candidate by score for
+            # diagnostics only.
+            best_rows_for_lookup = []
+            second_rows = []
+            for key, group in shot_df.groupby(["shot", "experimental_feature_id_global"], dropna=False):
+                accepted_g = group[group["is_global_best"].astype(bool)]
+                if not accepted_g.empty:
+                    ranked = accepted_g.sort_values(
+                        ["candidate_score", "proximity_score", "abs_delta_nm", "intensity"],
+                        ascending=[False, False, True, False]
+                    )
+                else:
+                    ranked = group.sort_values(
+                        ["candidate_score", "proximity_score", "abs_delta_nm", "intensity"],
+                        ascending=[False, False, True, False]
+                    )
+
+                if ranked.empty:
+                    continue
+
+                best_row = ranked.iloc[0]
+                best_rows_for_lookup.append(best_row)
+
+                alt = group.copy()
+                same_best = (
+                    alt["type of element"].astype(str).eq(str(best_row["type of element"]))
+                    & np.isclose(pd.to_numeric(alt["wavelength"], errors="coerce"), float(best_row["wavelength"]), equal_nan=False)
+                )
+                alt = alt[~same_best]
+                if not alt.empty:
+                    alt = alt.sort_values(
+                        ["candidate_score", "proximity_score", "abs_delta_nm", "intensity"],
+                        ascending=[False, False, True, False]
+                    )
+                    second_rows.append(alt.iloc[0])
+
+            best_lookup_df = pd.DataFrame(best_rows_for_lookup) if best_rows_for_lookup else pd.DataFrame()
+            best_lookup = best_lookup_df.set_index(["shot", "experimental_feature_id_global"]) if not best_lookup_df.empty else None
+            second = pd.DataFrame(second_rows) if second_rows else pd.DataFrame()
+            second_lookup = second.set_index(["shot", "experimental_feature_id_global"]) if not second.empty else None
+
+            def lookup_col(row, lookup, col, default=np.nan):
+                if lookup is None:
+                    return default
+                try:
+                    return lookup.loc[(row["shot"], row["experimental_feature_id_global"]), col]
+                except Exception:
+                    return default
+
+            shot_df["best_element_for_feature"] = [lookup_col(r, best_lookup, "type of element", "") for _, r in shot_df.iterrows()]
+            shot_df["best_wavelength_for_feature_nm"] = [lookup_col(r, best_lookup, "wavelength", np.nan) for _, r in shot_df.iterrows()]
+            shot_df["best_delta_for_feature_nm"] = [lookup_col(r, best_lookup, "delta_nm", np.nan) for _, r in shot_df.iterrows()]
+            shot_df["best_candidate_score_for_feature"] = [lookup_col(r, best_lookup, "candidate_score", np.nan) for _, r in shot_df.iterrows()]
+
+            if second_lookup is not None:
+                shot_df["second_element_for_feature"] = [lookup_col(r, second_lookup, "type of element", "") for _, r in shot_df.iterrows()]
+                shot_df["second_wavelength_for_feature_nm"] = [lookup_col(r, second_lookup, "wavelength", np.nan) for _, r in shot_df.iterrows()]
+                shot_df["second_delta_for_feature_nm"] = [lookup_col(r, second_lookup, "delta_nm", np.nan) for _, r in shot_df.iterrows()]
+                shot_df["second_candidate_score_for_feature"] = [lookup_col(r, second_lookup, "candidate_score", np.nan) for _, r in shot_df.iterrows()]
+            else:
+                shot_df["second_element_for_feature"] = ""
+                shot_df["second_wavelength_for_feature_nm"] = np.nan
+                shot_df["second_delta_for_feature_nm"] = np.nan
+                shot_df["second_candidate_score_for_feature"] = np.nan
+
             shot_tables.append(shot_df)
 
         if not shot_tables:
@@ -3202,67 +4357,459 @@ class ShotComparisonTab:
 
         out = pd.concat(shot_tables, ignore_index=True)
         out = out.sort_values(
-            ["rank_in_shot", "shot_order", "intensity"],
-            ascending=[True, True, False]
+            ["rank_in_shot", "shot_order", "is_global_best", "candidate_score", "intensity"],
+            ascending=[True, True, False, False, False],
+            na_position="last"
         ).reset_index(drop=True)
 
         first_cols = [
-            "shot",
-            "type of element",
-            "wavelength",
-            "intensity",
-            "rank_in_shot",
-            "experimental_wavelength_nm",
-            "delta_nm",
-            "nist_relative_intensity",
-            "nist_relative_intensity_numeric",
-            "candidate_score",
-            "proximity_score",
-            "nist_score_norm",
+            "shot", "type of element", "wavelength", "intensity", "rank_in_shot",
+            "accepted_line_rank_in_shot", "feature_rank_in_shot",
+            "experimental_raw_wavelength_nm", "experimental_calibrated_wavelength_nm",
+            "experimental_wavelength_nm", "experimental_peak_wavelength_nm",
+            "experimental_raw_peak_wavelength_nm", "delta_nm",
+            "match_tolerance_used_nm", "accepted_exclusion_half_width_nm",
+            "is_hydrogen_balmer", "hydrogen_balmer_name",
+            "is_calibration_anchor", "calibration_anchor_line",
+            "is_global_best", "is_suppressed_by_exclusion_window", "suppression_reason",
+            "suppressed_by_element", "suppressed_by_wavelength_nm",
+            "candidate_score", "proximity_score",
+            "experimental_score_norm", "nist_score_norm", "element_prior_score", "line_density_penalty_score",
+            "best_element_for_feature", "best_wavelength_for_feature_nm",
+            "best_delta_for_feature_nm", "second_element_for_feature", "second_wavelength_for_feature_nm",
+            "second_delta_for_feature_nm", "relative_intensity_in_shot",
+            "nist_relative_intensity", "nist_relative_intensity_numeric",
         ]
+        existing_first_cols = [c for c in first_cols if c in out.columns]
         other_cols = [
             c for c in out.columns
-            if c not in first_cols + [
-                "shot_order",
-                "abs_delta_nm",
-                "experimental_peak_bin_global",
-                "nist_intensity_for_score",
-                "nist_log_for_score",
-            ]
+            if c not in existing_first_cols + ["shot_order", "abs_delta_nm", "nist_intensity_for_score", "nist_log_for_score"]
         ]
+        out = out[existing_first_cols + other_cols]
 
-        out = out[first_cols + other_cols]
+        self.nist_all_candidates_cache = out.copy()
         self.nist_all_matches_cache = out.copy()
         self.nist_all_matches_cache_key = cache_key
         return out.copy()
 
-    def compute_selected_spectroscopy_matches(self):
+
+    def _selected_spectroscopy_candidates(self):
         """
-        Return selected/visible matched lines from the all-elements assignment.
+        Return all candidate rows restricted to the currently selected local NIST files.
 
-        Toggle selected only filters this precomputed global assignment. It does not
-        recompute line ownership, so a line first assigned to H remains H even if the
-        current display filter asks to show Fe only.
+        This method does not decide which candidate is physically preferred. It only
+        applies the GUI file/element selection after the all-elements matching cache
+        has already been computed.
         """
-        all_matches = self.compute_all_spectroscopy_matches()
-        if all_matches.empty:
-            return all_matches
+        all_candidates = self.compute_all_spectroscopy_matches()
+        if all_candidates.empty:
+            return all_candidates
 
-        out = all_matches
-        if self.selected_nist_files:
-            out = out[out["source_file"].astype(str).isin(self.selected_nist_files)].copy()
-        else:
-            out = out.iloc[0:0].copy()
+        if not self.selected_nist_files:
+            return all_candidates.iloc[0:0].copy()
 
-        max_lines = int(getattr(self, "nist_display_max_lines", 10))
-        if max_lines > 0 and "rank_in_shot" in out.columns:
-            out = out[out["rank_in_shot"].astype(float) <= max_lines].copy()
+        source_mask = all_candidates["source_file"].astype(str).isin(self.selected_nist_files)
+
+        # Synthetic calibration-anchor rows may use the special fallback source
+        # "calibration_anchor_H" if no local H file name was available. Keep them
+        # visible whenever the user selected at least one H NIST file.
+        selected_h = False
+        try:
+            for file_name in self.selected_nist_files:
+                if normalize_element_label(guess_element_from_filename(file_name)) == "H":
+                    selected_h = True
+                    break
+        except Exception:
+            selected_h = False
+
+        anchor_mask = pd.Series(False, index=all_candidates.index)
+        if selected_h and "is_calibration_anchor" in all_candidates.columns:
+            anchor_mask = (
+                all_candidates["is_calibration_anchor"].fillna(False).astype(bool)
+                & all_candidates["type of element"].astype(str).map(normalize_element_label).eq("H")
+            )
+
+        out = all_candidates[source_mask | anchor_mask].copy()
+
+        return out.reset_index(drop=True)
+
+    def _sort_candidates_by_feature(self, df):
+        """
+        Sort candidate rows inside each experimental feature and assign
+        candidate_rank_for_feature.
+
+        candidate_rank_for_feature = 1 means the most likely candidate for that
+        feature among the rows passed to this helper. This is a diagnostic ranking;
+        the accepted global assignment is still indicated by is_global_best.
+        """
+        if df is None or df.empty:
+            return df.copy() if df is not None else pd.DataFrame()
+
+        out = df.copy()
+
+        if "experimental_feature_id_global" not in out.columns:
+            if "experimental_feature_id" in out.columns:
+                out["experimental_feature_id_global"] = pd.to_numeric(
+                    out["experimental_feature_id"], errors="coerce"
+                ).fillna(-1).astype(int)
+            else:
+                bin_width = max(float(getattr(self, "nist_match_tolerance_nm", NIST_MATCH_TOLERANCE_NM)) / 2.0, 1e-9)
+                out["experimental_feature_id_global"] = np.round(
+                    pd.to_numeric(out["experimental_wavelength_nm"], errors="coerce").fillna(0.0) / bin_width
+                ).astype(int)
+
+        if "feature_rank_in_shot" not in out.columns:
+            if "rank_in_shot" in out.columns:
+                out["feature_rank_in_shot"] = out["rank_in_shot"]
+            else:
+                out["feature_rank_in_shot"] = np.nan
+
+        out["_score_sort"] = pd.to_numeric(out.get("candidate_score", np.nan), errors="coerce").fillna(-np.inf)
+        out["_prox_sort"] = pd.to_numeric(out.get("proximity_score", np.nan), errors="coerce").fillna(-np.inf)
+        out["_intensity_sort"] = pd.to_numeric(out.get("intensity", np.nan), errors="coerce").fillna(-np.inf)
+        out["_abs_delta_sort"] = pd.to_numeric(out.get("delta_nm", np.nan), errors="coerce").abs().fillna(np.inf)
+        out["_is_anchor_sort"] = (
+            out["is_calibration_anchor"].astype(bool).astype(int)
+            if "is_calibration_anchor" in out.columns else 0
+        )
+        out["_is_balmer_sort"] = (
+            out["is_hydrogen_balmer"].astype(bool).astype(int)
+            if "is_hydrogen_balmer" in out.columns else 0
+        )
 
         out = out.sort_values(
-            ["rank_in_shot", "shot", "intensity"],
-            ascending=[True, True, False]
+            [
+                "shot",
+                "experimental_feature_id_global",
+                "_is_anchor_sort",
+                "_score_sort",
+                "_is_balmer_sort",
+                "_prox_sort",
+                "_abs_delta_sort",
+                "_intensity_sort",
+            ],
+            ascending=[True, True, False, False, False, False, True, False],
         ).reset_index(drop=True)
+
+        out["candidate_rank_for_feature"] = (
+            out.groupby(["shot", "experimental_feature_id_global"], dropna=False)
+               .cumcount()
+               + 1
+        )
+
+        return out.drop(
+            columns=[
+                "_score_sort", "_prox_sort", "_intensity_sort", "_abs_delta_sort",
+                "_is_anchor_sort", "_is_balmer_sort",
+            ],
+            errors="ignore"
+        )
+
+    def _apply_feature_line_limit(self, df):
+        """
+        Apply the Max lines/shot limit as a feature-rank limit.
+
+        For the best-candidate table this means top N accepted lines per shot.
+        For the all-candidates table this means all candidate alternatives
+        belonging to the top N experimental features per shot.
+        """
+        if df is None or df.empty:
+            return df.copy() if df is not None else pd.DataFrame()
+
+        out = df.copy()
+        max_lines = int(getattr(self, "nist_display_max_lines", 10))
+        if max_lines <= 0:
+            return out
+
+        rank_col = "feature_rank_in_shot" if "feature_rank_in_shot" in out.columns else "rank_in_shot"
+        if rank_col in out.columns:
+            ranks = pd.to_numeric(out[rank_col], errors="coerce")
+            out = out[ranks <= max_lines].copy()
+
+        return out.reset_index(drop=True)
+
+    def _add_alternative_candidate_columns(self, best_df, candidates_df, max_alternatives=3):
+        """
+        Add candidate_2_*, candidate_3_*, ... columns to the best-candidate table.
+
+        These columns are diagnostic only. The actual accepted candidate remains
+        the main row itself:
+            type of element, wavelength, delta_nm, candidate_score
+
+        If Fe 655.455 nm is compatible with the same H-alpha feature, it can
+        appear as candidate_2_* or candidate_3_* rather than being hidden.
+        """
+        if best_df is None or best_df.empty:
+            return best_df.copy() if best_df is not None else pd.DataFrame()
+
+        if candidates_df is None or candidates_df.empty:
+            return best_df.copy()
+
+        candidates_ranked = self._sort_candidates_by_feature(candidates_df)
+        out = best_df.copy()
+
+        group_cols = ["shot", "experimental_feature_id_global"]
+        if not all(c in out.columns for c in group_cols) or not all(c in candidates_ranked.columns for c in group_cols):
+            return out
+
+        # Precompute candidate groups for quick lookup.
+        grouped = {
+            key: group.reset_index(drop=True)
+            for key, group in candidates_ranked.groupby(group_cols, dropna=False)
+        }
+
+        for n in range(2, max_alternatives + 1):
+            out[f"candidate_{n}_element"] = ""
+            out[f"candidate_{n}_wavelength_nm"] = np.nan
+            out[f"candidate_{n}_delta_nm"] = np.nan
+            out[f"candidate_{n}_score"] = np.nan
+            out[f"candidate_{n}_source_file"] = ""
+            out[f"candidate_{n}_is_calibration_anchor"] = False
+
+        for idx, row in out.iterrows():
+            key = (row.get("shot", None), row.get("experimental_feature_id_global", None))
+            group = grouped.get(key)
+            if group is None or group.empty:
+                continue
+
+            alternatives = []
+            main_element = str(row.get("type of element", ""))
+            try:
+                main_wavelength = float(row.get("wavelength", np.nan))
+            except Exception:
+                main_wavelength = np.nan
+
+            for _, cand in group.iterrows():
+                cand_element = str(cand.get("type of element", ""))
+                try:
+                    cand_wavelength = float(cand.get("wavelength", np.nan))
+                except Exception:
+                    cand_wavelength = np.nan
+
+                same_as_main = (
+                    cand_element == main_element
+                    and np.isfinite(cand_wavelength)
+                    and np.isfinite(main_wavelength)
+                    and abs(cand_wavelength - main_wavelength) < 1e-9
+                )
+                if same_as_main:
+                    continue
+                alternatives.append(cand)
+
+            for n, cand in enumerate(alternatives[: max_alternatives - 1], start=2):
+                out.at[idx, f"candidate_{n}_element"] = cand.get("type of element", "")
+                out.at[idx, f"candidate_{n}_wavelength_nm"] = cand.get("wavelength", np.nan)
+                out.at[idx, f"candidate_{n}_delta_nm"] = cand.get("delta_nm", np.nan)
+                out.at[idx, f"candidate_{n}_score"] = cand.get("candidate_score", np.nan)
+                out.at[idx, f"candidate_{n}_source_file"] = cand.get("source_file", "")
+                out.at[idx, f"candidate_{n}_is_calibration_anchor"] = bool(cand.get("is_calibration_anchor", False))
+
         return out
+
+    def _reorder_best_spectroscopy_columns(self, df):
+        """Put the physically important columns first in the best-candidate table."""
+        if df is None or df.empty:
+            return df.copy() if df is not None else pd.DataFrame()
+
+        first_cols = [
+            "rank_in_shot",
+            "shot",
+            "type of element",
+            "wavelength",
+            "intensity",
+            "experimental_raw_wavelength_nm",
+            "experimental_calibrated_wavelength_nm",
+            "delta_nm",
+            "match_tolerance_used_nm",
+            "accepted_exclusion_half_width_nm",
+            "is_hydrogen_balmer",
+            "hydrogen_balmer_name",
+            "is_calibration_anchor",
+            "calibration_anchor_line",
+            "is_suppressed_by_exclusion_window",
+            "suppression_reason",
+            "suppressed_by_element",
+            "suppressed_by_wavelength_nm",
+            "candidate_score",
+            "proximity_score",
+            "relative_intensity_in_shot",
+            "source_file",
+            "experimental_feature_id_global",
+            "feature_center_nm",
+            "feature_peak_wavelength_nm",
+            "feature_width_nm",
+            "feature_n_points",
+            "local_background",
+            "local_excess",
+            "local_integrated_intensity",
+            "nist_relative_intensity",
+            "nist_relative_intensity_numeric",
+            "element_prior_score",
+            "line_density_penalty_score",
+            "wavelength_calibration",
+            "halpha_temporal_integral_real_time_positive",
+            "halpha_temporal_duration_s_real_window",
+            "halpha_temporal_mean_real_window",
+        ]
+
+        # Put alternatives after the main accepted identification, but before the
+        # long diagnostic metadata block.
+        alt_cols = []
+        for n in range(2, 5):
+            alt_cols.extend([
+                f"candidate_{n}_element",
+                f"candidate_{n}_wavelength_nm",
+                f"candidate_{n}_delta_nm",
+                f"candidate_{n}_score",
+                f"candidate_{n}_source_file",
+                f"candidate_{n}_is_calibration_anchor",
+            ])
+
+        existing = [c for c in first_cols + alt_cols if c in df.columns]
+        hidden_or_redundant = {
+            "global_rank_in_shot",
+            "best_element_for_feature",
+            "best_wavelength_for_feature_nm",
+            "best_delta_for_feature_nm",
+            "best_candidate_score_for_feature",
+            "second_element_for_feature",
+            "second_wavelength_for_feature_nm",
+            "second_delta_for_feature_nm",
+            "second_candidate_score_for_feature",
+            "experimental_wavelength_nm",
+            "experimental_peak_wavelength_nm",
+            "experimental_raw_peak_wavelength_nm",
+            "is_global_best",
+        }
+        rest = [c for c in df.columns if c not in existing and c not in hidden_or_redundant]
+        return df[existing + rest]
+
+    def _reorder_candidate_spectroscopy_columns(self, df):
+        """Put the feature/candidate-rank columns first in the diagnostic table."""
+        if df is None or df.empty:
+            return df.copy() if df is not None else pd.DataFrame()
+
+        first_cols = [
+            "shot",
+            "experimental_feature_id_global",
+            "feature_rank_in_shot",
+            "candidate_rank_for_feature",
+            "is_global_best",
+            "type of element",
+            "wavelength",
+            "intensity",
+            "experimental_raw_wavelength_nm",
+            "experimental_calibrated_wavelength_nm",
+            "delta_nm",
+            "match_tolerance_used_nm",
+            "accepted_exclusion_half_width_nm",
+            "is_suppressed_by_exclusion_window",
+            "suppression_reason",
+            "suppressed_by_element",
+            "suppressed_by_wavelength_nm",
+            "candidate_score",
+            "proximity_score",
+            "is_hydrogen_balmer",
+            "hydrogen_balmer_name",
+            "is_calibration_anchor",
+            "calibration_anchor_line",
+            "source_file",
+            "relative_intensity_in_shot",
+            "element_prior_score",
+            "line_density_penalty_score",
+            "nist_local_line_density",
+            "nist_relative_intensity",
+            "nist_relative_intensity_numeric",
+            "feature_center_nm",
+            "feature_peak_wavelength_nm",
+            "feature_start_nm",
+            "feature_end_nm",
+            "feature_width_nm",
+            "feature_n_points",
+            "local_background",
+            "local_excess",
+            "local_integrated_intensity",
+        ]
+        existing = [c for c in first_cols if c in df.columns]
+        # Keep compatibility wavelength aliases but move them away from the main
+        # comparison columns so they do not confuse raw/calibrated/NIST lambda.
+        late_aliases = [c for c in ["experimental_wavelength_nm", "experimental_peak_wavelength_nm", "experimental_raw_peak_wavelength_nm"] if c in df.columns]
+        rest = [c for c in df.columns if c not in existing and c not in late_aliases]
+        return df[existing + late_aliases + rest]
+
+    def compute_spectroscopy_best_global_table(self):
+        """
+        Return the clean spectroscopy result table: one accepted candidate per
+        experimental feature.
+
+        This is the table intended for analysis. The ranking is always:
+            rank_in_shot = 1, 2, 3, ...
+        ordered by the experimental intensity of the accepted features in each shot.
+        Candidate alternatives are not separate rows here; they are shown in
+        candidate_2_*, candidate_3_* columns to the right.
+        """
+        selected_candidates = self._selected_spectroscopy_candidates()
+        if selected_candidates.empty:
+            return selected_candidates
+
+        if "is_global_best" not in selected_candidates.columns:
+            best = selected_candidates.copy()
+        else:
+            best = selected_candidates[selected_candidates["is_global_best"].astype(bool)].copy()
+
+        if best.empty:
+            return best
+
+        # Re-rank only accepted rows by intensity within each shot.
+        best["_intensity_sort"] = pd.to_numeric(best.get("intensity", np.nan), errors="coerce").fillna(-np.inf)
+        best = best.sort_values(["shot", "_intensity_sort"], ascending=[True, False]).reset_index(drop=True)
+        best["rank_in_shot"] = best.groupby("shot").cumcount() + 1
+        best["feature_rank_in_shot"] = best["rank_in_shot"]
+
+        best = self._apply_feature_line_limit(best)
+
+        # Add second/third/fourth alternatives as diagnostic columns on the right.
+        best = self._add_alternative_candidate_columns(
+            best,
+            selected_candidates,
+            max_alternatives=4
+        )
+
+        best = best.drop(columns=["_intensity_sort"], errors="ignore")
+        best = best.sort_values(["rank_in_shot", "shot"], ascending=[True, True]).reset_index(drop=True)
+        return self._reorder_best_spectroscopy_columns(best)
+
+    def compute_spectroscopy_candidate_table(self):
+        """
+        Return the diagnostic spectroscopy table: all candidate lines by feature.
+
+        This table can contain several rows for the same experimental feature.
+        Use candidate_rank_for_feature to see which candidate is most likely
+        within that feature. Use is_global_best to see which one is accepted in
+        the clean best-candidate table.
+        """
+        candidates = self._selected_spectroscopy_candidates()
+        if candidates.empty:
+            return candidates
+
+        out = self._sort_candidates_by_feature(candidates)
+        out = self._apply_feature_line_limit(out)
+
+        out = out.sort_values(
+            ["feature_rank_in_shot", "shot", "candidate_rank_for_feature"],
+            ascending=[True, True, True]
+        ).reset_index(drop=True)
+
+        return self._reorder_candidate_spectroscopy_columns(out)
+
+    def compute_selected_spectroscopy_matches(self):
+        """
+        Backward-compatible name used by the plot overlay.
+
+        It now returns only the clean best-global table, not every candidate.
+        To inspect all alternatives, use compute_spectroscopy_candidate_table().
+        """
+        return self.compute_spectroscopy_best_global_table()
 
     def show_matched_spectroscopy_figure(self, matches_df):
         """
@@ -3313,7 +4860,7 @@ class ShotComparisonTab:
         cut_max = 625.0
 
         df = matches_df.copy()
-        for col in ["shot", "wavelength", "intensity", "rank_in_shot", "experimental_wavelength_nm"]:
+        for col in ["shot", "wavelength", "intensity", "rank_in_shot", "experimental_wavelength_nm", "experimental_raw_wavelength_nm", "experimental_calibrated_wavelength_nm"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -3549,7 +5096,7 @@ class ShotComparisonTab:
         if df.empty:
             return
 
-        # Keep only the first N globally assigned lines per shot in the visualizer.
+        # Keep only the first N selected matched lines per shot in the visualizer.
         max_lines = int(getattr(self, "nist_display_max_lines", 10))
         plot_df = df.copy()
         if max_lines > 0 and "rank_in_shot" in plot_df.columns:
@@ -3602,7 +5149,7 @@ class ShotComparisonTab:
         self.ax_avantes.text(
             0.01,
             0.98,
-            f"NIST filter: {', '.join(sorted({str(x) for x in df['type of element'].unique()}))} | top {getattr(self, 'nist_display_max_lines', 10)} lines/shot",
+            f"NIST filter: {', '.join(sorted({str(x) for x in df['type of element'].unique()}))} | top {getattr(self, 'nist_display_max_lines', 10)} features/shot | {'calibrated' if getattr(self, 'spectroscopy_calibration_enabled', False) else 'raw λ'}",
             transform=self.ax_avantes.transAxes,
             fontsize=8,
             va="top",
@@ -4173,13 +5720,15 @@ class ShotComparisonTab:
             time_active=time_active
         )
 
-        return get_normalized_spectrum(
+        wl, spec_y = get_normalized_spectrum(
             data['wavelengths_Avantes'],
             data['intensities_Avantes_raw'],
             plasma_duration,
             self.normalization_mode,
             ip_norm
         )
+        wl = self.apply_spectroscopy_calibration_to_wavelengths(data, wl)
+        return wl, spec_y
 
     def plot_data(self):
         self.rebuild_plot_axes()
