@@ -6,7 +6,7 @@ import requests
 NIST_URL = "https://physics.nist.gov/cgi-bin/ASD/lines1.pl"
 
 # Carpeta local donde se guardarán los CSV
-OUTPUT_DIR = Path(r"C:\Users\chelo\MEPHIST-0_visualizer\Lineas de emisión")
+OUTPUT_DIR = Path(r"C:\Users\chelo\MEPHIST-0_visualizer\Líneas de emisión")
 
 
 def build_nist_url(
