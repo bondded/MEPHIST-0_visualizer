@@ -28,6 +28,10 @@ def trapz_compat(y, x=None):
         return np.trapezoid(y, x)
     return np.trapz(y, x)
 import traceback
+try:
+    from scipy.signal import savgol_filter
+except Exception:
+    savgol_filter = None
 
 # =========================================================
 # EXPORT HELPERS
@@ -153,6 +157,20 @@ IP_STEP_PLATEAU_PRE_WINDOW_US = 70
 IP_STEP_PLATEAU_POST_WINDOW_US = 100
 IP_STEP_PLATEAU_DROP_RATIO = 0.05
 IP_STEP_PLATEAU_POST_ABSOLUTE_SLOPE_KA_PER_MS = 0.90
+
+# Recent-shot high-current residual plateau detector. Some recent shots use a
+# simplified internal-Rogowski Ip reconstruction that can remain at a high flat
+# offset after the real current phase. This detector is still Ip-based: it cuts
+# only when Ip has dropped significantly after Ip,max and then becomes sustained
+# flat. It does NOT use the MEPhIST H-alpha duration to define the main plasma
+# window.
+IP_HIGH_RESIDUAL_PLATEAU_DETECTION_ENABLED = True
+IP_HIGH_RESIDUAL_MIN_AFTER_PEAK_US = 250
+IP_HIGH_RESIDUAL_PRE_WINDOW_US = 700
+IP_HIGH_RESIDUAL_POST_WINDOW_US = 300
+IP_HIGH_RESIDUAL_DROP_RATIO = 0.12
+IP_HIGH_RESIDUAL_POST_SLOPE_LIMIT_KA_PER_MS = 0.20
+IP_HIGH_RESIDUAL_POST_VARIATION_RATIO = 0.035
 
 IP_MIN_DURATION_US = 20
 IP_REPRESENTATIVE_SMOOTH_US = 10
@@ -914,6 +932,93 @@ def detect_ip_step_to_plateau_time(
     return None, "step_plateau_not_found"
 
 
+def detect_ip_high_residual_plateau_time(
+    Time,
+    Ip,
+    start_time,
+    peak_idx=None,
+    ip_max_ref=None,
+    smooth_us=IP_END_AFTER_MAX_SMOOTH_US
+):
+    """
+    Detect a high-current residual plateau after a significant post-peak drop.
+
+    This is intended for recent shots where the simplified internal-Rogowski
+    reconstruction can leave a nearly flat high offset after the useful current
+    phase. It remains an Ip-based criterion and is independent of the MEPhIST
+    H-alpha duration.
+    """
+    if not IP_HIGH_RESIDUAL_PLATEAU_DETECTION_ENABLED:
+        return None, "high_residual_plateau_disabled"
+
+    Time = np.asarray(Time)
+    Ip = np.asarray(Ip)
+    if len(Time) < 10 or len(Ip) < 10:
+        return None, "high_residual_plateau_invalid_signal"
+
+    dt = float(np.median(np.diff(Time)))
+    if not np.isfinite(dt) or dt <= 0:
+        return None, "high_residual_plateau_invalid_dt"
+
+    Ip_smooth_A = smooth_signal_time(Time, Ip, window_us=smooth_us)
+    Ip_kA = Ip_smooth_A / 1000.0
+
+    if peak_idx is None or peak_idx < 0 or peak_idx >= len(Time):
+        after_indices = np.where(Time >= start_time)[0]
+        if len(after_indices) < 2:
+            return None, "high_residual_plateau_no_after_start"
+        peak_idx = int(after_indices[int(np.nanargmax(Ip_kA[after_indices]))])
+
+    if ip_max_ref is None or ip_max_ref <= 0:
+        ip_max_ref = float(max(Ip_kA[peak_idx], 0.0) * 1000.0)
+
+    ip_max_kA = float(ip_max_ref) / 1000.0
+    if not np.isfinite(ip_max_kA) or ip_max_kA <= 0:
+        return None, "high_residual_plateau_bad_ipmax"
+
+    min_after = max(int(np.ceil((IP_HIGH_RESIDUAL_MIN_AFTER_PEAK_US * 1e-6) / dt)), 1)
+    pre_samples = max(int(np.ceil((IP_HIGH_RESIDUAL_PRE_WINDOW_US * 1e-6) / dt)), 2)
+    post_samples = max(int(np.ceil((IP_HIGH_RESIDUAL_POST_WINDOW_US * 1e-6) / dt)), 3)
+
+    start_idx = min(peak_idx + min_after, len(Time) - post_samples - 1)
+    stop_idx = len(Time) - post_samples - 1
+    if start_idx >= stop_idx:
+        return None, "high_residual_plateau_no_room"
+
+    dIp_dt_kA_per_ms = np.gradient(Ip_kA, Time) / 1000.0
+    slope_limit = float(IP_HIGH_RESIDUAL_POST_SLOPE_LIMIT_KA_PER_MS)
+    drop_limit = float(IP_HIGH_RESIDUAL_DROP_RATIO) * ip_max_kA
+    variation_limit = float(IP_HIGH_RESIDUAL_POST_VARIATION_RATIO) * ip_max_kA
+
+    peak_to_now_max = ip_max_kA
+
+    for idx in range(start_idx, stop_idx):
+        peak_to_now_max = max(peak_to_now_max, float(np.nanmax(Ip_kA[max(peak_idx, idx - pre_samples):idx + 1])))
+        post = Ip_kA[idx:idx + post_samples]
+        post_slope = np.abs(dIp_dt_kA_per_ms[idx:idx + post_samples])
+        if post.size < 3:
+            continue
+        post_mean = float(np.nanmean(post))
+        post_range = float(np.nanmax(post) - np.nanmin(post))
+        post_slope_mean = float(np.nanmean(post_slope))
+        drop_from_peak = peak_to_now_max - post_mean
+
+        if drop_from_peak < drop_limit:
+            continue
+        if post_range > variation_limit:
+            continue
+        if post_slope_mean > slope_limit:
+            continue
+        # Do not cut while Ip is still strongly decreasing. The first point of a
+        # genuinely flat residual offset should already have small local slope.
+        if abs(float(dIp_dt_kA_per_ms[idx])) > slope_limit:
+            continue
+
+        return Time[idx], "Ip_high_residual_plateau_after_drop"
+
+    return None, "high_residual_plateau_not_found"
+
+
 def get_plasma_end_time(
     Time,
     Ip,
@@ -968,6 +1073,18 @@ def get_plasma_end_time(
             smooth_us=smooth_us
         )
 
+    high_residual_end = None
+    high_residual_method = "high_residual_plateau_not_checked"
+    if IP_HIGH_RESIDUAL_PLATEAU_DETECTION_ENABLED:
+        high_residual_end, high_residual_method = detect_ip_high_residual_plateau_time(
+            Time,
+            Ip,
+            start_time=start_time,
+            peak_idx=peak_idx,
+            ip_max_ref=ip_max_ref,
+            smooth_us=smooth_us
+        )
+
     end_time = threshold_end
     method = "Ip_after_max_threshold"
 
@@ -979,6 +1096,8 @@ def get_plasma_end_time(
         candidates.append((plateau_end, plateau_method))
     if step_end is not None and np.isfinite(step_end) and step_end > start_time and step_end <= threshold_end:
         candidates.append((step_end, step_method))
+    if high_residual_end is not None and np.isfinite(high_residual_end) and high_residual_end > start_time and high_residual_end <= threshold_end:
+        candidates.append((high_residual_end, high_residual_method))
 
     if candidates:
         end_time, method = min(candidates, key=lambda x: x[0])
@@ -992,6 +1111,8 @@ def get_plasma_end_time(
             "plateau_method": plateau_method,
             "step_plateau_end_time": step_end,
             "step_plateau_method": step_method,
+            "high_residual_plateau_end_time": high_residual_end,
+            "high_residual_plateau_method": high_residual_method,
             "peak_time": Time[peak_idx] if peak_idx is not None and 0 <= peak_idx < len(Time) else np.nan,
             "ip_max_ref_A": ip_max_ref,
         }
@@ -1651,8 +1772,12 @@ def compute_reproducibility(processed_data):
     return df_time, df_global, df_delays, df_covariance
 
 def compute_all_analysis_tables(processed_data):
-    shot_summary_rows, halpha_rows, halpha_real_rows, timing_rows, global_rows, covariance_rows = [], [], [], [], [], []
+    shot_summary_rows, halpha_rows, halpha_real_rows, timing_rows, global_rows, covariance_rows, important_rows = [], [], [], [], [], [], []
     for data in processed_data:
+        try:
+            important_rows.append(compute_important_data_row(data))
+        except Exception:
+            pass
         halpha = compute_halpha_integral_metrics(data)
         if halpha is not None:
             halpha_rows.append(halpha)
@@ -1666,6 +1791,7 @@ def compute_all_analysis_tables(processed_data):
         shot_summary_rows.append({'shot': data['shot_number'], 'file_path': data.get('file_path', ''), 'Bt_start_ms': data['Bt_sync_time'] * 1000, 'Ip_start_ms': data['Ip_start_time'] * 1000, 'Ip_start_method': data.get('Ip_start_method', ''), 'Ip_start_threshold_ms': data.get('Ip_start_threshold_time', np.nan) * 1000, 'Ip_start_peak_ms': data.get('Ip_start_peak_time', np.nan) * 1000, 'Ip_start_threshold_A': data.get('Ip_start_threshold_A', np.nan), 'Ip_start_ip_max_ref_A': data.get('Ip_start_ip_max_ref_A', np.nan), 'Ip_end_ms': data['Ip_end_time'] * 1000, 'Halpha_end_ms': data.get('Halpha_end_time', data['Ip_end_time']) * 1000, 'Ip_delay_from_Bt_ms': data['Ip_delay_ms'], 'plasma_duration_ms': data['plasma_duration_sec'] * 1000, 'Halpha_duration_ms': data.get('halpha_duration_sec', max(data.get('Halpha_end_time', data['Ip_end_time']) - data['Ip_start_time'], 0.0)) * 1000, 'Ip_max_kA': data['I_p_max_kA'], 'Ip_max_rep_kA': data['I_p_max_rep_kA'], 'Bt_max_mT': data['B_phi_max_mT'], 'Ip_baseline_A': data['Ip_baseline_A'], 'Ip_baseline_method': data['Ip_baseline_method'], 'pressure_group_from_folder': data.get('pressure_group', ''), 'plasma_end_method': data.get('plasma_end_method', ''), 'Halpha_end_method': data.get('Halpha_end_method', ''), 'Ip_threshold_end_ms': data.get('Ip_threshold_end_time', np.nan) * 1000, 'Ip_plateau_end_ms': data.get('Ip_plateau_end_time', np.nan) * 1000 if data.get('Ip_plateau_end_time', None) is not None else np.nan, 'Ip_peak_time_ms': data.get('Ip_peak_time', np.nan) * 1000, 'Ip_plateau_method': data.get('Ip_plateau_method', ''), 'Ip_step_plateau_end_ms': data.get('Ip_step_plateau_end_time', np.nan) * 1000 if data.get('Ip_step_plateau_end_time', None) is not None else np.nan, 'Ip_step_plateau_method': data.get('Ip_step_plateau_method', '')})
     
     tables = {
+        'important_data': pd.DataFrame(important_rows),
         'shot_summary': pd.DataFrame(shot_summary_rows), 'halpha_integrals': pd.DataFrame(halpha_rows),
         'halpha_real_window_integrals': pd.DataFrame(halpha_real_rows),
         'timing_delays': pd.DataFrame(timing_rows), 'global_metrics': pd.DataFrame(global_rows),
@@ -1734,144 +1860,929 @@ def compute_group_average_variability(processed_data, band_factor=1.0, smooth_ip
     df_group = pd.DataFrame({'time_bt_ms': ref_time_bt * 1000, 'time_ip_ms': ref_time_ip * 1000, 'Bt_mean_mT': Bt_mean, 'Bt_std_mT': Bt_std, 'Bt_lower_mT': Bt_lower, 'Bt_upper_mT': Bt_upper, 'Ip_mean_kA': Ip_mean / 1000, 'Ip_std_kA': Ip_std / 1000, 'Ip_lower_kA': Ip_lower / 1000, 'Ip_upper_kA': Ip_upper / 1000, 'Halpha_mean': Ha_mean, 'Halpha_std': Ha_std, 'Halpha_lower': Ha_lower, 'Halpha_upper': Ha_upper})
     return {'group_label': group_label, 'ref_time_bt': ref_time_bt, 'ref_time_ip': ref_time_ip, 'Bt_mean': Bt_mean, 'Bt_std': Bt_std, 'Bt_lower': Bt_lower, 'Bt_upper': Bt_upper, 'Ip_mean': Ip_mean, 'Ip_std': Ip_std, 'Ip_lower': Ip_lower, 'Ip_upper': Ip_upper, 'Ha_mean': Ha_mean, 'Ha_std': Ha_std, 'Ha_lower': Ha_lower, 'Ha_upper': Ha_upper, 'df_group': df_group, 'n_shots': len(processed_data), 'is_single_shot': is_single, 'shot_numbers': [d['shot_number'] for d in processed_data], 'band_factor': band_factor, 'smooth_bt_us': smooth_bt_us, 'smooth_ip_us': smooth_ip_us, 'smooth_halpha_us': smooth_halpha_us}
 
+def compute_halpha_duration_official_style(Time, Halpha, level_percent=6.0, start_time_ms=4.0, stop_time_ms=18.0):
+    """
+    H-alpha based duration inspired by the recent MEPhIST/MephistDataKit notebooks.
+
+    It is deliberately kept as an additional diagnostic, not as a replacement for
+    the Ip-defined plasma duration used by the rest of this visualizer.
+    """
+    Time = np.asarray(Time, dtype=float)
+    Halpha = np.asarray(Halpha, dtype=float)
+    if Time.size < 5 or Halpha.size < 5 or Time.shape != Halpha.shape:
+        return np.nan, np.nan, np.nan, np.nan
+
+    t_ms = Time * 1000.0
+    mask = (t_ms >= float(start_time_ms)) & (t_ms <= float(stop_time_ms))
+    if np.sum(mask) < 5:
+        return np.nan, np.nan, np.nan, np.nan
+
+    t_cut_s = Time[mask]
+    t_cut_ms = t_ms[mask]
+    ha_abs = np.abs(Halpha[mask].astype(float))
+
+    if ha_abs.size < 5 or not np.any(np.isfinite(ha_abs)):
+        return np.nan, np.nan, np.nan, np.nan
+
+    # Linear edge detrend like the notebook version. It helps remove slow offsets.
+    try:
+        t0, t1 = float(t_cut_s[0]), float(t_cut_s[-1])
+        y0, y1 = float(ha_abs[0]), float(ha_abs[-1])
+        if t1 > t0:
+            a = (y1 - y0) / (t1 - t0)
+            b = y0 - a * t0
+            ha_work = ha_abs - (a * t_cut_s + b)
+        else:
+            ha_work = ha_abs.copy()
+    except Exception:
+        ha_work = ha_abs.copy()
+
+    ha_work = positive_part(ha_work)
+
+    # Savitzky-Golay smoothing when SciPy is available. Otherwise use a compact
+    # moving-average fallback so the GUI does not depend on SciPy for loading.
+    if savgol_filter is not None and ha_work.size >= 7:
+        win = min(200, ha_work.size - 1)
+        if win % 2 == 0:
+            win -= 1
+        if win >= 5:
+            try:
+                ha_smooth = savgol_filter(ha_work, window_length=win, polyorder=3)
+            except Exception:
+                ha_smooth = ha_work
+        else:
+            ha_smooth = ha_work
+    else:
+        win = min(101, ha_work.size)
+        if win < 3:
+            ha_smooth = ha_work
+        else:
+            if win % 2 == 0:
+                win -= 1
+            kernel = np.ones(win) / win
+            ha_smooth = np.convolve(ha_work, kernel, mode="same")
+
+    peak = float(np.nanmax(ha_smooth)) if ha_smooth.size else np.nan
+    if not np.isfinite(peak) or peak <= 0:
+        return np.nan, np.nan, np.nan, peak
+
+    threshold = (float(level_percent) / 100.0) * peak
+
+    start_idx = None
+    t_start = np.nan
+    for i in range(len(t_cut_s) - 1):
+        if ha_smooth[i] <= threshold and ha_smooth[i + 1] > threshold:
+            denom = ha_smooth[i + 1] - ha_smooth[i]
+            frac = 0.0 if abs(denom) < 1e-15 else (threshold - ha_smooth[i]) / denom
+            t_start = t_cut_s[i] + frac * (t_cut_s[i + 1] - t_cut_s[i])
+            start_idx = i
+            break
+
+    if start_idx is None:
+        return np.nan, np.nan, np.nan, peak
+
+    t_end = np.nan
+    for i in range(len(t_cut_s) - 1, start_idx, -1):
+        if ha_smooth[i - 1] > threshold and ha_smooth[i] <= threshold:
+            denom = ha_smooth[i] - ha_smooth[i - 1]
+            frac = 0.0 if abs(denom) < 1e-15 else (threshold - ha_smooth[i - 1]) / denom
+            t_end = t_cut_s[i - 1] + frac * (t_cut_s[i] - t_cut_s[i - 1])
+            break
+
+    if not np.isfinite(t_end):
+        t_end = t_cut_s[-1]
+
+    duration_ms = (t_end - t_start) * 1000.0 if t_end > t_start else np.nan
+    return duration_ms, t_start * 1000.0, t_end * 1000.0, peak
+
+
+
+
+
+def prepare_visible_emission_for_display(Time, t_raw_s, y_raw, baseline_end_ms=5.5):
+    """
+    Convert the visible-emission / H-alpha photodiode signal to the convention
+    used by the official viewer: near-zero pre-plasma baseline and positive
+    plasma emission.
+
+    Why this is needed:
+      - Old files can store H-alpha with a negative DC offset and positive burst.
+      - Recent files can store the burst with opposite polarity.
+      - Taking abs(raw) directly is wrong when the raw signal has a large DC
+        offset: it creates an artificial flat high pre-plasma baseline.
+
+    Procedure:
+      1) Estimate a pre-plasma baseline from the first milliseconds.
+      2) Subtract that baseline.
+      3) Choose the polarity whose main 4-16 ms excursion is positive.
+      4) Clip negative residuals to zero for the display/integral channel.
+    """
+    Time = np.asarray(Time, dtype=float)
+    t_raw_s = np.asarray(t_raw_s, dtype=float)
+    y_raw = np.asarray(y_raw, dtype=float)
+
+    if Time.size == 0 or t_raw_s.size < 2 or y_raw.size < 2:
+        return np.zeros_like(Time), np.zeros_like(Time), np.nan, 'missing'
+
+    n = min(t_raw_s.size, y_raw.size)
+    t = t_raw_s[:n]
+    y = y_raw[:n]
+    valid = np.isfinite(t) & np.isfinite(y)
+    if np.sum(valid) < 2:
+        return np.zeros_like(Time), np.zeros_like(Time), np.nan, 'invalid'
+    t = t[valid]
+    y = y[valid]
+    order = np.argsort(t)
+    t = t[order]
+    y = y[order]
+
+    t_ms = t * 1000.0
+    base_mask = (t_ms >= 0.0) & (t_ms <= float(baseline_end_ms))
+    if np.sum(base_mask) < 10:
+        # fallback: first 5 percent of samples, capped to a reasonable range
+        n_base = max(10, min(1000, int(0.05 * y.size)))
+        base_values = y[:n_base]
+    else:
+        base_values = y[base_mask]
+    baseline = float(np.nanmedian(base_values)) if base_values.size else 0.0
+    y0 = y - baseline
+
+    plasma_mask = (t_ms >= 4.0) & (t_ms <= 16.0)
+    if np.sum(plasma_mask) < 10:
+        plasma_mask = np.ones_like(y0, dtype=bool)
+
+    y_win = y0[plasma_mask]
+    pos_peak = float(np.nanpercentile(np.maximum(y_win, 0.0), 99.5)) if y_win.size else 0.0
+    neg_peak = float(np.nanpercentile(np.maximum(-y_win, 0.0), 99.5)) if y_win.size else 0.0
+
+    if neg_peak > 1.15 * max(pos_peak, 1e-15):
+        y_oriented = -y0
+        polarity = 'inverted_after_baseline'
+    else:
+        y_oriented = y0
+        polarity = 'positive_after_baseline'
+
+    # Remove small negative baseline/noise after orientation. This is the signal
+    # that should be compared visually with the official H-alpha panel.
+    y_positive = positive_part(y_oriented)
+
+    photod = np.interp(Time, t, y_positive, left=0.0, right=0.0)
+    signed_setzero = np.interp(Time, t, y_oriented, left=0.0, right=0.0)
+    return photod, signed_setzero, baseline, polarity
+
+
+def parse_shot_setpoints_from_text(text_value):
+    """Extract CS, TF and requested pressure from free-text metadata/comment."""
+    text_value = '' if text_value is None else str(text_value)
+    out = {'CS_voltage_V': np.nan, 'TF_voltage_V': np.nan, 'pressure_requested_mPa': np.nan}
+
+    # Examples found in files/comments:
+    #   "H2 CS1000 TF340 18mPa"
+    #   "norm TF340 before Li"
+    patterns = {
+        'CS_voltage_V': r'\bCS\s*[:=]?\s*([-+]?\d+(?:[\.,]\d+)?)\s*V?\b',
+        'TF_voltage_V': r'\bTF\s*[:=]?\s*([-+]?\d+(?:[\.,]\d+)?)\s*V?\b',
+        'pressure_requested_mPa': r'([-+]?\d+(?:[\.,]\d+)?)\s*mPa\b',
+    }
+    for key, pat in patterns.items():
+        m = re.search(pat, text_value, flags=re.IGNORECASE)
+        if m:
+            try:
+                out[key] = float(m.group(1).replace(',', '.'))
+            except Exception:
+                pass
+    return out
+
+
+def infer_default_setpoints(shot_id_int):
+    """
+    Last-resort setpoints used in the recent-shot notebook examples.
+    These are only used when the HDF5 metadata/comment does not explicitly store
+    the setpoint.
+    """
+    if shot_id_int >= 3800:
+        return {'CS_voltage_V': 900.0, 'TF_voltage_V': 340.0}
+    return {'CS_voltage_V': np.nan, 'TF_voltage_V': np.nan}
+
+def choose_preferred_plasma_end_time(
+    Time,
+    t0_ip,
+    t_end_ip,
+    ip_end_method,
+    halpha_official_end_ms=np.nan,
+    halpha_official_duration_ms=np.nan,
+    halpha_detector_end=None,
+):
+    """
+    Keep the visualizer's own Ip-based plasma end as the preferred plasma end.
+
+    The H-alpha/MEPhIST-style duration is still computed and exported as an
+    alternative diagnostic, but it must not replace the main plasma window used
+    for tau, normalization and shot-to-shot comparison. This avoids mixing two
+    different definitions of plasma duration between old and recent files.
+    """
+    return t_end_ip, str(ip_end_method), False
+
+def f_1_qa(kappa, delta):
+    return (1.0 + kappa**2 * (1.0 + 2.0 * delta**2 - 1.2 * delta**3)) / 2.0
+
+
+def f_2_qa(R, a):
+    A = R / a
+    return (1.17 - 0.65 / A) / (1.0 - A**(-2))**2
+
+
+def compute_qa_profile_from_data(Time, Ip_A, B_phi_mT, a=0.10, R=0.25, kappa=1.7, delta=0.0):
+    """Return q(a) profile using the same simple estimate used in the notebook."""
+    Time = np.asarray(Time, dtype=float)
+    Ip_A = np.asarray(Ip_A, dtype=float)
+    B_phi_mT = np.asarray(B_phi_mT, dtype=float)
+    if Time.size == 0 or Ip_A.size == 0 or B_phi_mT.size == 0:
+        return np.array([]), np.array([])
+    n = min(Time.size, Ip_A.size, B_phi_mT.size)
+    Time = Time[:n]
+    Ip_A = Ip_A[:n]
+    B_phi_mT = B_phi_mT[:n]
+    Bt_T = B_phi_mT / 1000.0
+    Ip_MA = Ip_A / 1e6
+    q = np.full_like(Time, np.nan, dtype=float)
+    mask = np.isfinite(Ip_MA) & np.isfinite(Bt_T) & (np.abs(Ip_MA) > 1e-4)
+    q[mask] = (5.0 * a**2 * Bt_T[mask] * f_1_qa(kappa, delta) * f_2_qa(R, a)) / (R * np.abs(Ip_MA[mask]))
+    return Time, q
+
+
+def compute_important_data_row(data):
+    """Build one compact row with the same quantities shown in the official viewer/table."""
+    Time = np.asarray(data.get('Time', np.array([])), dtype=float)
+    Ip = np.asarray(data.get('Ip', np.array([])), dtype=float)
+    Bt = np.asarray(data.get('B_phi', np.array([])), dtype=float)
+    CS = np.asarray(data.get('CS_current_kA', np.array([])), dtype=float)
+    TF = np.asarray(data.get('TF_current_kA', np.array([])), dtype=float)
+
+    # q(a) must be evaluated only during the physical plasma interval.
+    # If we take the minimum over the whole record, the early pre-plasma region
+    # where Bt ~ 0 can produce artificial q ~ 0 values. This made new and old
+    # shots incomparable. Therefore the Important data table reports q(a)_min
+    # over the Ip-defined plasma window and with weak low-signal guard masks.
+    _, q_profile = compute_qa_profile_from_data(Time, Ip, Bt)
+    q_mask = np.isfinite(q_profile)
+    if Time.size and Ip.size and Bt.size:
+        t_start_q = data.get('Ip_start_time', np.nan)
+        t_end_q = data.get('Ip_end_time', np.nan)
+        if np.isfinite(t_start_q) and np.isfinite(t_end_q) and t_end_q > t_start_q:
+            q_mask &= (Time >= t_start_q) & (Time <= t_end_q)
+        ip_ref_q = np.nanmax(np.abs(Ip)) if Ip.size else np.nan
+        if np.isfinite(ip_ref_q) and ip_ref_q > 0:
+            q_mask &= (np.abs(Ip) >= max(0.05 * ip_ref_q, 1000.0))
+        q_mask &= (np.abs(Bt) >= 20.0)
+    q_min = float(np.nanmin(q_profile[q_mask])) if q_profile.size and np.any(q_mask) else np.nan
+
+    row = {
+        'shot': data.get('shot_number', ''),
+        'gas': data.get('gas', ''),
+        'pressure_measured_mPa': data.get('pressure_measured_mPa', np.nan),
+        'pressure_requested_mPa': data.get('pressure_requested_mPa', np.nan),
+        'CS_voltage_V': data.get('CS_voltage_V', np.nan),
+        'TF_voltage_V': data.get('TF_voltage_V', np.nan),
+        'I_max_kA': data.get('I_p_max_kA', np.nan),
+        'I_min_kA': float(np.nanmin(Ip) / 1000.0) if Ip.size else np.nan,
+        'Bt_max_mT': data.get('B_phi_max_mT', np.nan),
+        'Bt_min_mT': float(np.nanmin(Bt)) if Bt.size else np.nan,
+        'qa_min': q_min,
+        'duration_preferred_my_method_ms': data.get('plasma_duration_sec', np.nan) * 1000.0,
+        'duration_Ip_only_ms': data.get('plasma_duration_ip_only_sec', np.nan) * 1000.0,
+        'duration_MEPhIST_Halpha_method_ms': data.get('Halpha_official_duration_ms', np.nan),
+        'plasma_end_method_preferred': data.get('plasma_end_method', ''),
+        'plasma_end_method_Ip_only': data.get('plasma_end_method_ip_only', ''),
+        'plasma_end_halpha_guard_used': data.get('plasma_end_halpha_guard_used', False),
+        'Ip_start_ms': data.get('Ip_start_time', np.nan) * 1000.0,
+        'Ip_end_ms_preferred': data.get('Ip_end_time', np.nan) * 1000.0,
+        'Ip_end_ms_Ip_only': data.get('Ip_end_time_ip_only', np.nan) * 1000.0,
+        'Halpha_official_start_ms': data.get('Halpha_official_start_ms', np.nan),
+        'Halpha_official_end_ms': data.get('Halpha_official_end_ms', np.nan),
+        'Halpha_end_ms_detector': data.get('Halpha_end_time', np.nan) * 1000.0,
+        'Halpha_polarity_method': data.get('Halpha_polarity_method', ''),
+        'Halpha_baseline_raw': data.get('Halpha_baseline_raw', np.nan),
+        'CS_voltage_source': data.get('CS_voltage_source', ''),
+        'TF_voltage_source': data.get('TF_voltage_source', ''),
+        'CS_current_min_kA': float(np.nanmin(CS)) if CS.size and np.any(np.isfinite(CS)) else np.nan,
+        'CS_current_max_kA': float(np.nanmax(CS)) if CS.size and np.any(np.isfinite(CS)) else np.nan,
+        'TF_current_min_kA': float(np.nanmin(TF)) if TF.size and np.any(np.isfinite(TF)) else np.nan,
+        'TF_current_max_kA': float(np.nanmax(TF)) if TF.size and np.any(np.isfinite(TF)) else np.nan,
+        'PF1_current_max_kA': float(np.nanmax(np.asarray(data.get('PF1_current_kA', []), dtype=float))) if len(data.get('PF1_current_kA', [])) else np.nan,
+        'PF2_current_max_kA': float(np.nanmax(np.asarray(data.get('PF2_current_kA', []), dtype=float))) if len(data.get('PF2_current_kA', [])) else np.nan,
+        'PF3_current_max_kA': float(np.nanmax(np.asarray(data.get('PF3_current_kA', []), dtype=float))) if len(data.get('PF3_current_kA', [])) else np.nan,
+        'PF4_current_max_kA': float(np.nanmax(np.asarray(data.get('PF4_current_kA', []), dtype=float))) if len(data.get('PF4_current_kA', [])) else np.nan,
+        'spectrum_source': data.get('Avantes_intensity_source', ''),
+        'available_spectrum_sources': data.get('available_spectrum_sources', ''),
+        'default_spectrum_source': data.get('default_spectrum_source', ''),
+        'loader_mode': data.get('loader_mode', ''),
+        'missing_signals': ', '.join(map(str, data.get('missing_signals', []))),
+    }
+    return row
+
+
 def process_shot_data(file_path, save_to_csv=False):
+    """
+    Compatibility loader for old and recent MEPhIST-0 .nxs shots.
+
+    Main changes relative to the older loader:
+      - Supports old Rogowski names and new names (rog_TF, rog_CS, rog_PF*, rog_internal).
+      - Uses the recent simplified Ip reconstruction for shots >= 3355.
+      - Reads H-alpha like the official viewer/notebook: visible_emission as abs(signal).
+      - Reads spectroscopy from both Avantes and Oceanfx.
+      - Loads CS, PF coils, loop voltages and metadata for the important-data table.
+    """
+    missing_signals = []
+    used_signal_paths = {}
+
     try:
         with h5py.File(file_path, 'r') as f:
-            Time_original = f['rogowski_coils']['rog_tor_coils']['time'][:] / 1000
-            Time_internal_rog = f['rogowski_coils']['rog_internal']['time'][:] / 1000
+
+            stem = os.path.basename(file_path).split('.')[0]
+            shot_match = re.search(r"\d+", stem)
+            shot_number = shot_match.group(0) if shot_match else stem
+            try:
+                shot_id_int = int(shot_number)
+            except Exception:
+                shot_id_int = -1
+
+            pressure_group = os.path.basename(os.path.dirname(file_path))
             Time = np.linspace(0, 21e-3, 21000)
 
-            U_rog_TF = np.interp(Time, Time_original, set_zero(f['rogowski_coils']['rog_tor_coils']['data'][:]))
-            U_rog_CS = np.interp(Time, Time_original, set_zero(f['rogowski_coils']['rog_inductor']['data'][:]))
-            U_rog_PF1 = np.interp(Time, Time_original, set_zero(f['rogowski_coils']['rog_pol_coils1']['data'][:]))
-            U_rog_PF2 = np.interp(Time, Time_original, preprocess(f['rogowski_coils']['rog_pol_coils2']['data'][:]))
-            U_rog_PF3 = np.interp(Time, Time_original, set_zero(f['rogowski_coils']['rog_pol_coils3']['data'][:]))
-            U_rog_int = np.interp(Time, Time_internal_rog - 8.6e-5, f['rogowski_coils']['rog_internal']['data'][:])
+            def _decode_scalar_value(value):
+                try:
+                    if isinstance(value, bytes):
+                        return value.decode('utf-8').strip('\x00').strip()
+                    if hasattr(value, 'shape') and value.shape == ():
+                        value = value[()]
+                        return _decode_scalar_value(value)
+                    if isinstance(value, np.ndarray):
+                        if value.size == 1:
+                            return _decode_scalar_value(value.flat[0])
+                        return value
+                    return value
+                except Exception:
+                    return value
 
-            I_TF = abs(integrate(Time, U_rog_TF)) * K_ROG_TOR
-            B_phi = I_TF * K_TF
+            def _get_h5_object(root, path):
+                obj = root
+                for part in str(path).strip('/').split('/'):
+                    if not part:
+                        continue
+                    if hasattr(obj, 'keys') and part in obj:
+                        obj = obj[part]
+                    else:
+                        return None
+                return obj
 
-            Photod_raw = f['spectroscopy']['visible_emission']['data'][:]
-            Photod_time_raw = f['spectroscopy']['visible_emission']['time'][:] / 1000
-            Photod = np.interp(Time, Photod_time_raw, set_zero(Photod_raw))
-            if HALPHA_DISPLAY_SMOOTH_US > 0: Photod = smooth_signal_time(Time, Photod, window_us=HALPHA_DISPLAY_SMOOTH_US)
+            def _read_dataset_from_group(group, names):
+                if group is None:
+                    return np.array([]), ''
+                for name in names:
+                    if name in group:
+                        try:
+                            return np.asarray(group[name][:]), name
+                        except Exception:
+                            try:
+                                return np.asarray(group[name][()]), name
+                            except Exception:
+                                pass
+                return np.array([]), ''
 
-            synt_sig = -RC_transform(Time, U_rog_TF, 1, 1.8e-4) * 0.665
-            synt_sig -= 0.515 * (RC_transform(Time, U_rog_CS, 1, 8.6e-5) * 3 - RC_transform(Time, U_rog_CS, 1, 4.4e-4) * 1.67)
-            synt_sig += 0.5 * 1.1 * (RC_transform(Time, U_rog_PF1, 1, 5.5e-4) * 3.8 + RC_transform(Time, U_rog_PF1, 1, 5e-5) * 0.65)
-            synt_sig += RC_transform(Time, U_rog_PF2, 1, 4.5e-4) * 3.2 + RC_transform(Time, U_rog_PF2, 1, 15e-4) * 0.45
-            synt_sig += 1.05 * (RC_transform(Time, U_rog_PF3, 1, 60e-4) * 0.4 + RC_transform(Time, U_rog_PF3, 1, 6e-4) * 2.4)
+            def _normalize_time_units(t_raw):
+                t = np.asarray(t_raw, dtype=float)
+                if t.size == 0:
+                    return t
+                finite = np.isfinite(t)
+                if not np.any(finite):
+                    return t
+                t_abs_max = float(np.nanmax(np.abs(t[finite])))
+                if t_abs_max > 100.0:
+                    return t / 1e6     # likely microseconds
+                if t_abs_max > 0.5:
+                    return t / 1000.0  # likely milliseconds
+                return t               # likely seconds
 
-            U_rog_int_filt = U_rog_int - synt_sig
-            Ip_raw = integrate(Time, U_rog_int_filt) * 1.48e7 * 0.87
-            Ip, ip_baseline, ip_baseline_method = correct_ip_baseline_two_pass(Time, Ip_raw)
+            def _read_raw_channel(label, group_candidates, processor='set_zero', time_shift_s=0.0):
+                for group_path in group_candidates:
+                    group = _get_h5_object(f, group_path)
+                    if group is None:
+                        continue
+                    y_raw, y_key = _read_dataset_from_group(group, ('data', 'Data', 'signal', 'Signal', 'values', 'Values'))
+                    t_raw, t_key = _read_dataset_from_group(group, ('time', 'Time', 't', 'T'))
+                    if y_raw.size == 0 or t_raw.size == 0:
+                        continue
+                    t = _normalize_time_units(t_raw) + float(time_shift_s)
+                    y = np.asarray(y_raw, dtype=float)
+                    n = min(t.size, y.size)
+                    if n < 2:
+                        continue
+                    t, y = t[:n], y[:n]
+                    valid = np.isfinite(t) & np.isfinite(y)
+                    if np.sum(valid) < 2:
+                        continue
+                    t, y = t[valid], y[valid]
+                    order = np.argsort(t)
+                    t, y = t[order], y[order]
+                    if processor == 'set_zero':
+                        y = set_zero(y)
+                    elif processor == 'preprocess':
+                        y = preprocess(set_zero(y))
+                    elif processor == 'abs':
+                        y = np.abs(y)
+                    elif processor == 'abs_set_zero':
+                        y = np.abs(set_zero(y))
+                    elif processor == 'none':
+                        pass
+                    used_signal_paths[label] = f"{group_path}/{y_key}"
+                    return t, y
+                missing_signals.append(label)
+                used_signal_paths[label] = ''
+                return np.array([]), np.array([])
 
+            def _interp_channel(label, group_candidates, processor='set_zero', time_shift_s=0.0, default=0.0):
+                t, y = _read_raw_channel(label, group_candidates, processor=processor, time_shift_s=time_shift_s)
+                if t.size < 2 or y.size < 2:
+                    return np.full_like(Time, default, dtype=float)
+                return np.interp(Time, t, y, left=default, right=default)
+
+            def _read_scalar_path(path):
+                obj = _get_h5_object(f, path)
+                if obj is None:
+                    return None
+                try:
+                    return _decode_scalar_value(obj[()])
+                except Exception:
+                    return None
+
+            def _read_first_scalar(paths):
+                for path in paths:
+                    value = _read_scalar_path(path)
+                    if value is not None:
+                        return value, path
+                return None, ''
+
+            def _read_numeric_metadata_by_keywords(keywords, exclude_keywords=()):
+                keywords = tuple(k.lower() for k in keywords)
+                exclude_keywords = tuple(k.lower() for k in exclude_keywords)
+                matches = []
+                def visitor(name, obj):
+                    if len(matches) >= 1:
+                        return
+                    lname = name.lower()
+                    if all(k in lname for k in keywords) and not any(k in lname for k in exclude_keywords):
+                        try:
+                            val = _decode_scalar_value(obj[()])
+                            if isinstance(val, (int, float, np.integer, np.floating)) and np.isfinite(val):
+                                matches.append((float(val), name))
+                        except Exception:
+                            pass
+                try:
+                    f.visititems(visitor)
+                except Exception:
+                    pass
+                return matches[0] if matches else (np.nan, '')
+
+            def _parse_pressure_from_folder(label):
+                if not label:
+                    return np.nan
+                m = re.search(r"([-+]?\d+(?:[\.,]\d+)?)\s*m?pa", str(label), flags=re.IGNORECASE)
+                if m:
+                    return float(m.group(1).replace(',', '.'))
+                m = re.search(r"([-+]?\d+(?:[\.,]\d+)?)", str(label))
+                if m:
+                    return float(m.group(1).replace(',', '.'))
+                return np.nan
+
+            # Metadata: gas and pressures. Measured pressure is usually in Pa in
+            # total_pressure, hence Pa -> mPa is multiplication by 1e5.
+            gas, gas_path = _read_first_scalar((
+                'Vacuum/Pressure_fastValve/working_gas',
+                'Vacuum/Pressure/working_gas',
+                'META/Main/working_gas',
+            ))
+            gas = '' if gas is None else str(gas)
+
+            main_description, main_description_path = _read_first_scalar((
+                'META/Main/Description',
+                'META/Main/comment',
+                'META/Main/Comment',
+                'META/Main/Experiment',
+            ))
+            main_description = '' if main_description is None else str(main_description)
+            parsed_setpoints = parse_shot_setpoints_from_text(main_description)
+
+            p_meas_raw, p_meas_path = _read_first_scalar((
+                'Vacuum/Pressure/total_pressure',
+                'Vacuum/Pressure_fastValve/total_pressure',
+                'Vacuum/Pressure/pressure',
+                'Vacuum/Pressure_fastValve/pressure',
+            ))
+            try:
+                pressure_measured_mPa = float(p_meas_raw) * 1e5
+            except Exception:
+                pressure_measured_mPa = np.nan
+
+            p_req_raw, p_req_path = _read_first_scalar((
+                'Vacuum/Pressure/requested_pressure',
+                'Vacuum/Pressure/pressure_requested',
+                'Vacuum/Pressure/set_pressure',
+                'Vacuum/Pressure/target_pressure',
+                'Vacuum/Pressure_fastValve/requested_pressure',
+                'Vacuum/Pressure_fastValve/pressure_requested',
+                'Vacuum/Pressure_fastValve/set_pressure',
+                'Vacuum/Pressure_fastValve/target_pressure',
+            ))
+            try:
+                pressure_requested_mPa = float(p_req_raw) * 1e5
+            except Exception:
+                pressure_requested_mPa = parsed_setpoints.get('pressure_requested_mPa', np.nan)
+                if not np.isfinite(pressure_requested_mPa):
+                    pressure_requested_mPa = _parse_pressure_from_folder(pressure_group)
+
+            cs_voltage, cs_voltage_path = _read_numeric_metadata_by_keywords(('cs',), ('rog', 'current', 'time', 'data'))
+            tf_voltage, tf_voltage_path = _read_numeric_metadata_by_keywords(('tf',), ('rog', 'current', 'time', 'data'))
+
+            default_setpoints = infer_default_setpoints(shot_id_int)
+            if not np.isfinite(cs_voltage):
+                cs_voltage = parsed_setpoints.get('CS_voltage_V', np.nan)
+                cs_voltage_path = 'META/Main/Description' if np.isfinite(cs_voltage) else cs_voltage_path
+            if not np.isfinite(tf_voltage):
+                tf_voltage = parsed_setpoints.get('TF_voltage_V', np.nan)
+                tf_voltage_path = 'META/Main/Description' if np.isfinite(tf_voltage) else tf_voltage_path
+            if not np.isfinite(cs_voltage):
+                cs_voltage = default_setpoints.get('CS_voltage_V', np.nan)
+                cs_voltage_path = 'recent-shot notebook fallback' if np.isfinite(cs_voltage) else cs_voltage_path
+            if not np.isfinite(tf_voltage):
+                tf_voltage = default_setpoints.get('TF_voltage_V', np.nan)
+                tf_voltage_path = 'recent-shot notebook fallback' if np.isfinite(tf_voltage) else tf_voltage_path
+
+            # Raw Rogowski diagnostics.
+            U_rog_TF = _interp_channel('rog_TF_or_old_TF', (
+                'rogowski_coils/rog_TF', 'rogowski_coils/rog_tf', 'rogowski_coils/TF',
+                'rogowski_coils/rog_tor_coils', 'rogowski_coils/rog_tor_coil', 'rogowski_coils/rog_tor'
+            ), processor='set_zero')
+
+            U_rog_CS = _interp_channel('rog_CS_or_old_inductor', (
+                'rogowski_coils/rog_CS', 'rogowski_coils/rog_cs', 'rogowski_coils/CS',
+                'rogowski_coils/rog_inductor', 'rogowski_coils/inductor'
+            ), processor='set_zero')
+
+            U_rog_int = _interp_channel('rog_internal', (
+                'rogowski_coils/rog_internal', 'rogowski_coils/rog_int',
+                'rogowski_coils/internal', 'rogowski_coils/Ip', 'rogowski_coils/ip'
+            ), processor='none', time_shift_s=(-8.6e-5 if shot_id_int < 3355 else 0.0))
+
+            U_pf = {}
+            for i in range(1, 7):
+                U_pf[i] = _interp_channel(f'rog_PF{i}', (
+                    f'rogowski_coils/rog_PF{i}', f'rogowski_coils/rog_pf{i}', f'rogowski_coils/PF{i}',
+                    f'rogowski_coils/pf{i}', f'rogowski_coils/rog_pol_coils{i}', f'rogowski_coils/rog_pol_coil{i}'
+                ), processor=('preprocess' if i == 2 else 'set_zero'))
+
+            # Toroidal field. For new names use the current MephistDataKit/OceanFX
+            # convention; for old tor_coils keep the legacy conversion.
+            tf_source = used_signal_paths.get('rog_TF_or_old_TF', '')
+            if any(s in tf_source for s in ('rog_TF', 'rog_tf', '/TF')):
+                B_phi = K_TF * integrate(Time, U_rog_TF / 4.89) * 3.92e6
+                if np.nanmax(B_phi) < abs(np.nanmin(B_phi)):
+                    B_phi = -B_phi
+                TF_current_kA = integrate(Time, U_rog_TF / 4.89) * 3.92e6 / 1000.0
+            else:
+                I_TF = abs(integrate(Time, U_rog_TF)) * K_ROG_TOR
+                B_phi = I_TF * K_TF
+                TF_current_kA = I_TF / 1000.0
+
+            # CS/PF currents for the official-like diagnostics panel.
+            if any(s in used_signal_paths.get('rog_CS_or_old_inductor', '') for s in ('rog_CS', 'rog_cs', '/CS')):
+                CS_current_kA = K_ROG_IND * integrate(Time, U_rog_CS / 10.48) / 1000.0
+            else:
+                CS_current_kA = K_ROG_IND * integrate(Time, U_rog_CS) / 1000.0
+            # Keep the official-style current orientation positive for the main CS ramp.
+            if CS_current_kA.size and np.nanmax(CS_current_kA) < abs(np.nanmin(CS_current_kA)):
+                CS_current_kA = -CS_current_kA
+
+            pf_amp = {1: 19.05, 2: 19.05, 3: 42.86, 4: 42.86, 5: 32.14, 6: 32.14}
+            PF_current_kA = {}
+            for i in range(1, 7):
+                PF_current_kA[i] = K_ROG_PF1 * integrate(Time, U_pf[i] / pf_amp[i]) / 1000.0
+
+            # Plasma current. For shots after the Feb-2026 hardware change, use
+            # the simple continuous-winding internal Rogowski reconstruction.
+            if shot_id_int >= 3355:
+                loader_mode = 'new_ge3355_internal_rogowski'
+                Ip_raw = integrate(Time, -set_zero(U_rog_int)) * 2.8e3 * 1000.0  # kA -> A
+                Ip, ip_baseline, ip_baseline_method = correct_ip_baseline_two_pass(Time, Ip_raw)
+            else:
+                loader_mode = 'legacy_synthetic_subtraction'
+                synt_sig = -RC_transform(Time, U_rog_TF, 1, 1.8e-4) * 0.665
+                synt_sig -= 0.515 * (
+                    RC_transform(Time, U_rog_CS, 1, 8.6e-5) * 3
+                    - RC_transform(Time, U_rog_CS, 1, 4.4e-4) * 1.67
+                )
+                synt_sig += 0.5 * 1.1 * (
+                    RC_transform(Time, U_pf[1], 1, 5.5e-4) * 3.8
+                    + RC_transform(Time, U_pf[1], 1, 5e-5) * 0.65
+                )
+                synt_sig += (
+                    RC_transform(Time, U_pf[2], 1, 4.5e-4) * 3.2
+                    + RC_transform(Time, U_pf[2], 1, 15e-4) * 0.45
+                )
+                synt_sig += 1.05 * (
+                    RC_transform(Time, U_pf[3], 1, 60e-4) * 0.4
+                    + RC_transform(Time, U_pf[3], 1, 6e-4) * 2.4
+                )
+                U_rog_int_filt = U_rog_int - synt_sig
+                Ip_raw = integrate(Time, U_rog_int_filt) * 1.48e7 * 0.87
+                Ip, ip_baseline, ip_baseline_method = correct_ip_baseline_two_pass(Time, Ip_raw)
+
+            # Visible emission / H-alpha.
+            # Important: do NOT use abs(raw) directly. Recent/old files can have
+            # different polarity and a non-zero DC offset; abs(raw) turns that
+            # offset into a false flat high H-alpha level. We first subtract the
+            # pre-plasma baseline, then choose polarity, then clip to positive.
+            t_vis, y_vis_raw = _read_raw_channel('visible_emission', (
+                'spectroscopy/visible_emission', 'spectroscopy/H_alpha',
+                'spectroscopy/halpha', 'spectroscopy/Halpha', 'spectroscopy/photod', 'spectroscopy/Photod'
+            ), processor='none')
+            if t_vis.size >= 2 and y_vis_raw.size >= 2:
+                Photod, Photod_signed_setzero, halpha_baseline_raw, halpha_polarity_method = prepare_visible_emission_for_display(
+                    Time, t_vis, y_vis_raw
+                )
+            else:
+                Photod = np.zeros_like(Time)
+                Photod_signed_setzero = np.zeros_like(Time)
+                halpha_baseline_raw = np.nan
+                halpha_polarity_method = 'missing'
+            if HALPHA_DISPLAY_SMOOTH_US > 0:
+                Photod = smooth_signal_time(Time, Photod, window_us=HALPHA_DISPLAY_SMOOTH_US)
+
+            # Loop voltages. The official panel often shows (VL2 + VL7)/2.
+            def _load_voltage_loop(num):
+                return _interp_channel(f'VL{num}', (f'voltage_loops/VL{num}',), processor='set_zero')
+
+            VL2 = _load_voltage_loop(2)
+            VL3 = _load_voltage_loop(3)
+            VL7 = _load_voltage_loop(7)
+            Vloop_2_7 = 0.5 * (VL2 + VL7)
+            Vloop_2_3_7 = 0.5 * (VL7 + 0.5 * (VL2 + VL3))
+
+            # Main event times.
             t0_bt = find_bt_reference_time(Time, B_phi, BT_START_THRESHOLD_RATIO)
-
-            ip_start_info = get_ip_start_backward_from_peak_info(
-                Time,
-                Ip,
-                threshold_ratio=IP_START_THRESHOLD_RATIO,
-                min_duration_us=IP_MIN_DURATION_US
-            )
+            ip_start_info = get_ip_start_backward_from_peak_info(Time, Ip)
             t0_ip = ip_start_info['start_time']
             ip_start_method = ip_start_info.get('method', '')
 
-            # Plasma end is now defined from Ip. Priority:
-            #   1) start of a sustained low-slope Ip plateau after Ip,max,
-            #   2) fallback threshold after Ip,max.
-            ip_end_info = get_plasma_end_time(
-                Time,
-                Ip,
-                start_time=t0_ip,
-                threshold_ratio=IP_END_THRESHOLD_RATIO,
-                smooth_us=IP_END_AFTER_MAX_SMOOTH_US,
-                gap_us=IP_END_AFTER_MAX_GAP_US,
-                return_details=True
-            )
-            t_end_ip = ip_end_info['end_time']
-            plasma_end_method = ip_end_info['method']
+            ip_end_info = get_plasma_end_time(Time, Ip, t0_ip, return_details=True)
+            t_end_ip_only = ip_end_info['end_time']
+            plasma_end_method_ip_only = ip_end_info['method']
 
-            # H-alpha end is still computed and stored separately. It is used
-            # for H-alpha-specific integrals, but NOT for tau/plasma duration.
-            t_end_halpha, halpha_end_method = get_plasma_end_time_from_halpha(
-                Time,
-                Photod,
-                Ip,
-                start_time=t0_ip
-            )
-
+            t_end_halpha, halpha_end_method = get_plasma_end_time_from_halpha(Time, Photod, Ip, start_time=t0_ip)
             ip_crossings = find_ip_start_times(Time, Ip, IP_START_THRESHOLD_RATIO, IP_MIN_DURATION_US)
+
+            ha_off_dur_ms, ha_off_start_ms, ha_off_end_ms, ha_off_peak = compute_halpha_duration_official_style(Time, Photod)
+
+            # Preferred plasma window: keep the visualizer Ip detector by default,
+            # but if the new-shot Ip reconstruction never returns to low current,
+            # use H-alpha as a guard fallback. The Ip-only and MEPhIST/H-alpha
+            # durations are still stored separately in Important data.
+            t_end_ip, plasma_end_method, plasma_end_halpha_guard_used = choose_preferred_plasma_end_time(
+                Time,
+                t0_ip,
+                t_end_ip_only,
+                plasma_end_method_ip_only,
+                halpha_official_end_ms=ha_off_end_ms,
+                halpha_official_duration_ms=ha_off_dur_ms,
+                halpha_detector_end=t_end_halpha,
+            )
 
             Time_sync_bt, Time_sync_ip = Time - t0_bt, Time - t0_ip
             tau_plasma, plasma_duration_tau = get_tau(Time, t0_ip, t_end_ip)
             plasma_duration_sec = max(t_end_ip - t0_ip, 0.0)
+            plasma_duration_ip_only_sec = max(t_end_ip_only - t0_ip, 0.0) if np.isfinite(t_end_ip_only) else np.nan
             halpha_duration_sec = max(t_end_halpha - t0_ip, 0.0)
-            ip_delay_ms = (t0_ip - t0_bt) * 1000
+            ip_delay_ms = (t0_ip - t0_bt) * 1000.0
 
-            I_p_max_kA = np.max(Ip) / 1000.0
+            I_p_max_kA = np.nanmax(Ip) / 1000.0 if Ip.size else np.nan
             I_p_max_rep_kA = representative_max(Time, Ip, smooth_us=IP_REPRESENTATIVE_SMOOTH_US) / 1000.0
-            B_phi_max = np.max(B_phi)
+            B_phi_max = np.nanmax(B_phi) if B_phi.size else np.nan
 
+            # Spectrum: support both spectrometers when present.
+            # Internally, old variable names are kept for backward compatibility,
+            # but spectra_by_source stores each source separately so the GUI can
+            # switch between OceanFX and Avantes.
+            spectra_by_source = {}
             wavelengths_Avantes = np.array([])
             intensities_Avantes_raw = np.array([])
             intensities_Avantes_rw = np.array([])
             intensities_Avantes = np.array([])
-            Avantes_intensity_source = ""
+            Avantes_intensity_source = ''
 
-            if 'spectroscopy' in f and 'Avantes' in f['spectroscopy']:
+            def _store_spectrum_source(source_key, source_label, av_group):
                 try:
-                    av_group = f['spectroscopy']['Avantes']
+                    if av_group is None:
+                        return
                     wl_raw = av_group['Wavelength'][:] if 'Wavelength' in av_group else np.array([])
-
-                    # Display/backward-compatible spectrum: keep CleanI when available.
                     i_clean, clean_key = read_first_existing_dataset(
                         av_group,
-                        ("CleanI", "cleanI", "clean_i", "rw", "RW")
+                        ('CleanI', 'cleanI', 'clean_i', 'I', 'intensity', 'Intensity', 'Intensities')
                     )
-
-                    # Matched-line spectroscopy table: prefer RW, then fallback to CleanI.
-                    i_rw, rw_key = read_first_existing_dataset(
-                        av_group,
-                        AVANTES_RW_DATASET_CANDIDATES
-                    )
-
+                    i_rw, rw_key = read_first_existing_dataset(av_group, AVANTES_RW_DATASET_CANDIDATES)
                     if i_rw.size == 0:
                         i_rw = i_clean
                         rw_key = clean_key
-
                     if wl_raw.size > 0 and i_clean.size > 0 and wl_raw.shape == i_clean.shape:
-                        intensities_Avantes_raw = i_clean
-                        max_int = np.nanmax(i_clean)
-                        intensities_Avantes = i_clean / max_int if max_int > 0 else np.zeros_like(i_clean)
-                        wavelengths_Avantes = wl_raw
-
-                    if wl_raw.size > 0 and i_rw.size > 0 and wl_raw.shape == i_rw.shape:
-                        intensities_Avantes_rw = i_rw
-                        Avantes_intensity_source = rw_key
-
+                        raw = np.asarray(i_clean, dtype=float)
+                        rw = np.asarray(i_rw, dtype=float) if i_rw.size == wl_raw.size else raw.copy()
+                        max_int = np.nanmax(raw) if raw.size else np.nan
+                        norm_max = raw / max_int if np.isfinite(max_int) and max_int > 0 else np.zeros_like(raw)
+                        spectra_by_source[source_key] = {
+                            'source_key': source_key,
+                            'source_label': source_label,
+                            'wavelengths': np.asarray(wl_raw, dtype=float),
+                            'intensity_raw': raw,
+                            'intensity_rw': rw,
+                            'intensity_norm_max': norm_max,
+                            'intensity_source': f'{source_label}/{rw_key or clean_key}',
+                            'raw_dataset': clean_key,
+                            'rw_dataset': rw_key or clean_key,
+                        }
                 except Exception:
                     pass
 
-            shot_number = os.path.basename(file_path).split('.')[0][:-2]
-            pressure_group = os.path.basename(os.path.dirname(file_path))
+            if 'spectroscopy' in f:
+                try:
+                    spec_group = f['spectroscopy']
+                    if 'Oceanfx' in spec_group:
+                        _store_spectrum_source('Oceanfx', 'Oceanfx', spec_group['Oceanfx'])
+                    if 'OceanFX' in spec_group and 'Oceanfx' not in spectra_by_source:
+                        _store_spectrum_source('Oceanfx', 'OceanFX', spec_group['OceanFX'])
+                    if 'Avantes' in spec_group:
+                        _store_spectrum_source('Avantes', 'Avantes', spec_group['Avantes'])
+                except Exception:
+                    pass
 
-            main_data_df = pd.DataFrame({'time_ms': Time * 1000, 'time_sync_bt_ms': Time_sync_bt * 1000, 'time_sync_ip_ms': Time_sync_ip * 1000, 'tau_plasma': tau_plasma, 'Bt_mT': B_phi, 'Ip_kA': Ip / 1000, 'H_alpha': Photod})
-            spec_data_df = pd.DataFrame({'wavelength_nm': wavelengths_Avantes, 'intensity_raw': intensities_Avantes_raw, 'intensity_rw': intensities_Avantes_rw, 'intensity_norm_max': intensities_Avantes, 'intensity_source': Avantes_intensity_source}) if wavelengths_Avantes.size > 0 else pd.DataFrame()
+            default_spectrum_source = 'Oceanfx' if 'Oceanfx' in spectra_by_source else ('Avantes' if 'Avantes' in spectra_by_source else '')
+            if default_spectrum_source:
+                chosen_spec = spectra_by_source[default_spectrum_source]
+                wavelengths_Avantes = chosen_spec['wavelengths']
+                intensities_Avantes_raw = chosen_spec['intensity_raw']
+                intensities_Avantes_rw = chosen_spec['intensity_rw']
+                intensities_Avantes = chosen_spec['intensity_norm_max']
+                Avantes_intensity_source = chosen_spec['intensity_source']
+
+            main_data_df = pd.DataFrame({
+                'time_ms': Time * 1000,
+                'time_sync_bt_ms': Time_sync_bt * 1000,
+                'time_sync_ip_ms': Time_sync_ip * 1000,
+                'tau_plasma': tau_plasma,
+                'Bt_mT': B_phi,
+                'Ip_kA': Ip / 1000,
+                'H_alpha': Photod,
+                'CS_current_kA': CS_current_kA,
+                'TF_current_kA': TF_current_kA,
+                'PF1_current_kA': PF_current_kA[1],
+                'PF2_current_kA': PF_current_kA[2],
+                'PF3_current_kA': PF_current_kA[3],
+                'PF4_current_kA': PF_current_kA[4],
+                'PF5_current_kA': PF_current_kA[5],
+                'PF6_current_kA': PF_current_kA[6],
+                'VL2_V': VL2,
+                'VL3_V': VL3,
+                'VL7_V': VL7,
+                'Vloop_2_7_V': Vloop_2_7,
+                'Vloop_2_3_7_V': Vloop_2_3_7,
+            })
+
+            spec_rows = []
+            for _src_key, _src in spectra_by_source.items():
+                _wl = np.asarray(_src.get('wavelengths', []), dtype=float)
+                _raw = np.asarray(_src.get('intensity_raw', []), dtype=float)
+                _rw = np.asarray(_src.get('intensity_rw', []), dtype=float)
+                _norm = np.asarray(_src.get('intensity_norm_max', []), dtype=float)
+                if _wl.size and _raw.size and _wl.shape == _raw.shape:
+                    spec_rows.append(pd.DataFrame({
+                        'spectrum_source_key': _src_key,
+                        'wavelength_nm': _wl,
+                        'intensity_raw': _raw,
+                        'intensity_rw': _rw if _rw.shape == _wl.shape else _raw,
+                        'intensity_norm_max': _norm if _norm.shape == _wl.shape else np.nan,
+                        'intensity_source': _src.get('intensity_source', _src_key),
+                    }))
+            spec_data_df = pd.concat(spec_rows, ignore_index=True) if spec_rows else pd.DataFrame()
+
+            if missing_signals:
+                print(f"[WARN] Shot {shot_number}: missing optional signals {missing_signals}. Replaced with zeros where needed.")
+
+            data = {
+                'file_path': file_path,
+                'pressure_group': pressure_group,
+                'Time': Time,
+                'Time_sync_bt': Time_sync_bt,
+                'Time_sync_ip': Time_sync_ip,
+                'tau_plasma': tau_plasma,
+                'plasma_tau_duration': plasma_duration_tau,
+                'B_phi': B_phi,
+                'Ip': Ip,
+                'Ip_raw_before_baseline': Ip_raw,
+                'Photod': Photod,
+                'wavelengths_Avantes': wavelengths_Avantes,
+                'intensities_Avantes': intensities_Avantes,
+                'intensities_Avantes_raw': intensities_Avantes_raw,
+                'intensities_Avantes_rw': intensities_Avantes_rw,
+                'Avantes_intensity_source': Avantes_intensity_source,
+                'spectra_by_source': spectra_by_source,
+                'available_spectrum_sources': ', '.join(spectra_by_source.keys()),
+                'default_spectrum_source': default_spectrum_source,
+                'shot_number': shot_number,
+                'gas': gas,
+                'main_description': main_description,
+                'pressure_measured_mPa': pressure_measured_mPa,
+                'pressure_measured_source': p_meas_path,
+                'pressure_requested_mPa': pressure_requested_mPa,
+                'pressure_requested_source': p_req_path if p_req_path else 'folder_label',
+                'CS_voltage_V': cs_voltage,
+                'CS_voltage_source': cs_voltage_path,
+                'TF_voltage_V': tf_voltage,
+                'TF_voltage_source': tf_voltage_path,
+                'I_p_max_kA': I_p_max_kA,
+                'I_p_max_rep_kA': I_p_max_rep_kA,
+                'B_phi_max_mT': B_phi_max,
+                'plasma_duration_sec': plasma_duration_sec,
+                'halpha_duration_sec': halpha_duration_sec,
+                'Halpha_official_duration_ms': ha_off_dur_ms,
+                'Halpha_official_start_ms': ha_off_start_ms,
+                'Halpha_official_end_ms': ha_off_end_ms,
+                'Halpha_official_peak': ha_off_peak,
+                'plasma_duration_ip_only_sec': plasma_duration_ip_only_sec,
+                'Ip_end_time_ip_only': t_end_ip_only,
+                'plasma_end_method_ip_only': plasma_end_method_ip_only,
+                'plasma_end_halpha_guard_used': plasma_end_halpha_guard_used,
+                'Photod_signed_setzero': Photod_signed_setzero,
+                'Halpha_baseline_raw': halpha_baseline_raw,
+                'Halpha_polarity_method': halpha_polarity_method,
+                'Bt_sync_time': t0_bt,
+                'Ip_start_time': t0_ip,
+                'Ip_start_method': ip_start_method,
+                'Ip_start_threshold_time': ip_start_info.get('threshold_start_time', np.nan),
+                'Ip_start_peak_time': ip_start_info.get('ip_peak_time', np.nan),
+                'Ip_start_threshold_A': ip_start_info.get('ip_start_threshold_A', np.nan),
+                'Ip_start_ip_max_ref_A': ip_start_info.get('ip_start_ip_max_ref_A', np.nan),
+                'Ip_end_time': t_end_ip,
+                'Halpha_end_time': t_end_halpha,
+                'Ip_threshold_end_time': ip_end_info.get('threshold_end_time', np.nan),
+                'Ip_plateau_end_time': ip_end_info.get('plateau_end_time', np.nan),
+                'Ip_peak_time': ip_end_info.get('peak_time', np.nan),
+                'Ip_end_ip_max_ref_A': ip_end_info.get('ip_max_ref_A', np.nan),
+                'Ip_plateau_method': ip_end_info.get('plateau_method', ''),
+                'Ip_step_plateau_end_time': ip_end_info.get('step_plateau_end_time', np.nan),
+                'Ip_step_plateau_method': ip_end_info.get('step_plateau_method', ''),
+                'Halpha_end_method': halpha_end_method,
+                'plasma_end_method': plasma_end_method,
+                'Ip_delay_ms': ip_delay_ms,
+                'Ip_crossings': ip_crossings,
+                'Ip_min_duration_us': IP_MIN_DURATION_US,
+                'Ip_baseline_A': ip_baseline,
+                'Ip_baseline_method': ip_baseline_method,
+                'CS_current_kA': CS_current_kA,
+                'TF_current_kA': TF_current_kA,
+                'PF1_current_kA': PF_current_kA[1],
+                'PF2_current_kA': PF_current_kA[2],
+                'PF3_current_kA': PF_current_kA[3],
+                'PF4_current_kA': PF_current_kA[4],
+                'PF5_current_kA': PF_current_kA[5],
+                'PF6_current_kA': PF_current_kA[6],
+                'VL2_V': VL2,
+                'VL3_V': VL3,
+                'VL7_V': VL7,
+                'Vloop_2_7_V': Vloop_2_7,
+                'Vloop_2_3_7_V': Vloop_2_3_7,
+                'loader_mode': loader_mode,
+                'missing_signals': missing_signals,
+                'used_signal_paths': used_signal_paths,
+                'main_data_df': main_data_df,
+                'spec_data_df': spec_data_df,
+            }
 
             if save_to_csv:
                 local_folder = f"shot_{shot_number}"
                 os.makedirs(local_folder, exist_ok=True)
                 main_data_df.to_csv(f"{local_folder}/main_data.csv", index=False)
-                if not spec_data_df.empty: spec_data_df.to_csv(f"{local_folder}/spectroscopy.csv", index=False)
-                metadata = {'shot_number': shot_number, 'I_p_max_kA': float(I_p_max_kA), 'I_p_max_rep_kA': float(I_p_max_rep_kA), 'B_phi_max_mT': float(B_phi_max), 'plasma_duration_ms': float(plasma_duration_sec * 1000), 'halpha_duration_ms': float(halpha_duration_sec * 1000), 'Bt_sync_time_ms': float(t0_bt * 1000), 'Ip_start_time_ms': float(t0_ip * 1000), 'Ip_start_method': ip_start_method, 'Ip_start_threshold_ms': float(ip_start_info.get('threshold_start_time', np.nan) * 1000), 'Ip_start_peak_ms': float(ip_start_info.get('ip_peak_time', np.nan) * 1000), 'Ip_start_threshold_A': float(ip_start_info.get('ip_start_threshold_A', np.nan)), 'Ip_start_ip_max_ref_A': float(ip_start_info.get('ip_start_ip_max_ref_A', np.nan)), 'Ip_end_time_ms': float(t_end_ip * 1000), 'Halpha_end_time_ms': float(t_end_halpha * 1000), 'Ip_delay_from_Bt_ms': float(ip_delay_ms), 'Ip_min_duration_us': IP_MIN_DURATION_US, 'Ip_baseline_A': float(ip_baseline), 'Ip_baseline_method': ip_baseline_method, 'pressure_group': pressure_group, 'plasma_end_method': plasma_end_method, 'Halpha_end_method': halpha_end_method, 'Ip_threshold_end_ms': float(ip_end_info.get('threshold_end_time', np.nan) * 1000), 'Ip_plateau_end_ms': float(ip_end_info.get('plateau_end_time', np.nan) * 1000) if ip_end_info.get('plateau_end_time', None) is not None else None, 'Ip_peak_time_ms': float(ip_end_info.get('peak_time', np.nan) * 1000), 'Ip_step_plateau_end_ms': float(ip_end_info.get('step_plateau_end_time', np.nan) * 1000) if ip_end_info.get('step_plateau_end_time', None) is not None else None}
-                with open(f"{local_folder}/metadata.json", "w") as fjson: json.dump(metadata, fjson)
+                if not spec_data_df.empty:
+                    spec_data_df.to_csv(f"{local_folder}/spectroscopy.csv", index=False)
+                metadata = {k: v for k, v in data.items() if isinstance(v, (str, int, float, np.integer, np.floating)) or v is None}
+                metadata['missing_signals'] = missing_signals
+                metadata['used_signal_paths'] = used_signal_paths
+                with open(f"{local_folder}/metadata.json", "w", encoding="utf-8") as fjson:
+                    json.dump(metadata, fjson, default=str, indent=2)
 
-            return {'file_path': file_path, 'pressure_group': pressure_group, 'Time': Time, 'Time_sync_bt': Time_sync_bt, 'Time_sync_ip': Time_sync_ip, 'tau_plasma': tau_plasma, 'plasma_tau_duration': plasma_duration_tau, 'B_phi': B_phi, 'Ip': Ip, 'Ip_raw_before_baseline': Ip_raw, 'Photod': Photod, 'wavelengths_Avantes': wavelengths_Avantes, 'intensities_Avantes': intensities_Avantes, 'intensities_Avantes_raw': intensities_Avantes_raw, 'intensities_Avantes_rw': intensities_Avantes_rw, 'Avantes_intensity_source': Avantes_intensity_source, 'shot_number': shot_number, 'I_p_max_kA': I_p_max_kA, 'I_p_max_rep_kA': I_p_max_rep_kA, 'B_phi_max_mT': B_phi_max, 'plasma_duration_sec': plasma_duration_sec, 'halpha_duration_sec': halpha_duration_sec, 'Bt_sync_time': t0_bt, 'Ip_start_time': t0_ip, 'Ip_start_method': ip_start_method, 'Ip_start_threshold_time': ip_start_info.get('threshold_start_time', np.nan), 'Ip_start_peak_time': ip_start_info.get('ip_peak_time', np.nan), 'Ip_start_threshold_A': ip_start_info.get('ip_start_threshold_A', np.nan), 'Ip_start_ip_max_ref_A': ip_start_info.get('ip_start_ip_max_ref_A', np.nan), 'Ip_end_time': t_end_ip, 'Halpha_end_time': t_end_halpha, 'Ip_threshold_end_time': ip_end_info.get('threshold_end_time', np.nan), 'Ip_plateau_end_time': ip_end_info.get('plateau_end_time', np.nan), 'Ip_peak_time': ip_end_info.get('peak_time', np.nan), 'Ip_end_ip_max_ref_A': ip_end_info.get('ip_max_ref_A', np.nan), 'Ip_plateau_method': ip_end_info.get('plateau_method', ''), 'Ip_step_plateau_end_time': ip_end_info.get('step_plateau_end_time', np.nan), 'Ip_step_plateau_method': ip_end_info.get('step_plateau_method', ''), 'Halpha_end_method': halpha_end_method, 'plasma_end_method': plasma_end_method, 'Ip_delay_ms': ip_delay_ms, 'Ip_crossings': ip_crossings, 'Ip_min_duration_us': IP_MIN_DURATION_US, 'Ip_baseline_A': ip_baseline, 'Ip_baseline_method': ip_baseline_method, 'main_data_df': main_data_df, 'spec_data_df': spec_data_df}
+            return data
+
     except Exception as e:
         messagebox.showerror("Data Load Error", f"Could not load or process file {file_path}:\n{e}")
+        traceback.print_exc()
         return None
-
 
 # =========================================================
 # NIST EMISSION-LINE LOCAL DATABASE HELPERS
@@ -2748,6 +3659,13 @@ class ShotComparisonTab:
         self.display_time_mode = DISPLAY_SYNC
         self.show_residuals = False
 
+        # Spectroscopy source selection. Auto uses OceanFX when available,
+        # otherwise Avantes. Raw-count display is the default because it is
+        # closest to the official MEPhIST viewer. Matching/calibration can still
+        # use the selected source with its own normalization internally.
+        self.spectrum_source_mode = "Auto"
+        self.spectrum_display_mode = "raw"
+
         # Local NIST spectroscopy filtering state.
         self.selected_nist_files = set()
         self.nist_match_tolerance_nm = NIST_MATCH_TOLERANCE_NM
@@ -2842,6 +3760,7 @@ class ShotComparisonTab:
         )
         self.normalization_label.pack(side=tk.LEFT, padx=5, pady=2)
 
+
         self.cursor_toggle_button = tk.Button(
             self.top_button_frame1,
             text="Enable cursor dynamics",
@@ -2853,9 +3772,34 @@ class ShotComparisonTab:
         self.top_button_frame2 = tk.Frame(self.main_frame, bg="#f0f0f0")
         self.top_button_frame2.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
 
+        # Keep the spectrum source selector visible on the second toolbar.
+        # On narrow screens it was hidden at the far right of the first toolbar.
+        tk.Label(self.top_button_frame2, text="Spectrum:", bg="#f0f0f0").pack(side=tk.LEFT, padx=(5, 2), pady=2)
+        self.spectrum_source_var = tk.StringVar(value=self.spectrum_source_mode)
+        self.spectrum_source_combo = ttk.Combobox(
+            self.top_button_frame2,
+            textvariable=self.spectrum_source_var,
+            values=["Auto", "Oceanfx", "Avantes"],
+            state="readonly",
+            width=8
+        )
+        self.spectrum_source_combo.pack(side=tk.LEFT, padx=2, pady=2)
+        self.spectrum_source_combo.bind("<<ComboboxSelected>>", self.on_spectrum_source_changed)
+
+        self.spectrum_display_button = tk.Button(
+            self.top_button_frame2,
+            text="Spec: raw counts",
+            command=self.toggle_spectrum_display_mode,
+            bg="#eeeeee"
+        )
+        self.spectrum_display_button.pack(side=tk.LEFT, padx=2, pady=2)
+
         tk.Button(self.top_button_frame2, text="H-alpha integrals", command=self.show_halpha_integrals, bg="#e0e0e0").pack(side=tk.LEFT, padx=5, pady=2)
         tk.Button(self.top_button_frame2, text="H-alpha real integrals", command=self.show_halpha_real_integrals, bg="#e0e0e0").pack(side=tk.LEFT, padx=5, pady=2)
         tk.Button(self.top_button_frame2, text="Bt delay", command=self.show_bt_delays, bg="#e0e0e0").pack(side=tk.LEFT, padx=5, pady=2)
+        tk.Button(self.top_button_frame2, text="Important data", command=self.show_important_data, bg="#e0e0e0").pack(side=tk.LEFT, padx=5, pady=2)
+        tk.Button(self.top_button_frame2, text="Official-style plots", command=self.plot_official_style_diagnostics, bg="#e0e0e0").pack(side=tk.LEFT, padx=5, pady=2)
+        tk.Button(self.top_button_frame2, text="Spectrum sources", command=self.plot_spectrum_sources, bg="#e0e0e0").pack(side=tk.LEFT, padx=5, pady=2)
         tk.Button(self.top_button_frame2, text="Compute reproducibility", command=self.compute_reproducibility_gui, bg="#e0e0e0").pack(side=tk.LEFT, padx=5, pady=2)
         tk.Button(self.top_button_frame2, text="Generate comparison", command=self.generate_group_comparison, bg="#e0e0e0").pack(side=tk.LEFT, padx=5, pady=2)
         tk.Button(self.top_button_frame2, text="Export full analysis", command=self.export_full_analysis, bg="#e0e0e0").pack(side=tk.LEFT, padx=5, pady=2)
@@ -3045,6 +3989,94 @@ class ShotComparisonTab:
             self._syncing_xlim = False
 
 
+    def on_spectrum_source_changed(self, event=None):
+        """Update selected spectrometer source and refresh plots/matching cache."""
+        try:
+            self.spectrum_source_mode = str(self.spectrum_source_var.get()).strip() or "Auto"
+        except Exception:
+            self.spectrum_source_mode = "Auto"
+        self.nist_all_matches_cache = None
+        self.nist_all_matches_cache_key = None
+        self.nist_all_candidates_cache = None
+        self.plot_data()
+
+    def toggle_spectrum_display_mode(self):
+        """Toggle the main spectrum panel between official raw counts and normalized spectrum."""
+        self.spectrum_display_mode = "normalized" if getattr(self, "spectrum_display_mode", "raw") == "raw" else "raw"
+        if hasattr(self, "spectrum_display_button"):
+            self.spectrum_display_button.config(
+                text="Spec: normalized" if self.spectrum_display_mode == "normalized" else "Spec: raw counts"
+            )
+        self.plot_data()
+
+    def resolve_spectrum_source_key(self, data, requested=None):
+        """Return the concrete spectrum source key to use for a shot."""
+        spectra = data.get('spectra_by_source', {}) if isinstance(data, dict) else {}
+        if not spectra:
+            return ""
+        mode = str(requested if requested is not None else getattr(self, "spectrum_source_mode", "Auto")).strip()
+        if mode in spectra:
+            return mode
+        mode_low = mode.lower()
+        for key in spectra.keys():
+            if key.lower() == mode_low:
+                return key
+        if 'Oceanfx' in spectra:
+            return 'Oceanfx'
+        if 'Avantes' in spectra:
+            return 'Avantes'
+        return next(iter(spectra.keys()))
+
+    def get_selected_spectrum_arrays(self, data, use_rw=False):
+        """Return wl, intensity, source_label for the selected spectrometer source."""
+        spectra = data.get('spectra_by_source', {}) if isinstance(data, dict) else {}
+        key = self.resolve_spectrum_source_key(data)
+        if key and key in spectra:
+            s = spectra[key]
+            wl = np.asarray(s.get('wavelengths', np.array([])), dtype=float)
+            arr_key = 'intensity_rw' if use_rw else 'intensity_raw'
+            intensity = np.asarray(s.get(arr_key, np.array([])), dtype=float)
+            if intensity.size == 0 and use_rw:
+                intensity = np.asarray(s.get('intensity_raw', np.array([])), dtype=float)
+            label = s.get('intensity_source', key)
+            return wl, intensity, label, key
+        # Backward-compatible fallback
+        wl = np.asarray(data.get('wavelengths_Avantes', np.array([])), dtype=float)
+        intensity = np.asarray(data.get('intensities_Avantes_rw' if use_rw else 'intensities_Avantes_raw', np.array([])), dtype=float)
+        if intensity.size == 0 and use_rw:
+            intensity = np.asarray(data.get('intensities_Avantes_raw', np.array([])), dtype=float)
+        return wl, intensity, data.get('Avantes_intensity_source', 'spectrum'), data.get('default_spectrum_source', '')
+
+    def get_selected_spectroscopy_rw_normalized_arrays(self, data):
+        """Return selected-source wavelength and RW intensity normalized for matching."""
+        wl, rw, label, key = self.get_selected_spectrum_arrays(data, use_rw=True)
+        wl = np.asarray(wl, dtype=float)
+        rw = np.asarray(rw, dtype=float)
+        if wl.size == 0 or rw.size == 0 or wl.shape != rw.shape:
+            return wl, rw, {
+                "spectrum_source": label,
+                "spectrum_source_key": key,
+                "spectrum_normalization_factor": np.nan,
+                "plasma_duration_s_for_spectrum": np.nan,
+                "Ip_integral_plasma_tau_positive_A_for_spectrum": np.nan,
+                "Ip_integral_plasma_time_positive_C_for_spectrum": np.nan,
+            }
+        factor, duration_s, ip_integral_tau_A, ip_integral_time_C = get_spectroscopy_plasma_normalization_factor(
+            data.get("Time", np.array([])),
+            data.get("Ip", np.array([])),
+            data.get("Ip_start_time", np.nan),
+            data.get("Ip_end_time", np.nan),
+        )
+        rw_norm = rw / factor if factor and factor > 0 else rw
+        return wl, rw_norm, {
+            "spectrum_source": label,
+            "spectrum_source_key": key,
+            "spectrum_normalization_factor": factor,
+            "plasma_duration_s_for_spectrum": duration_s,
+            "Ip_integral_plasma_tau_positive_A_for_spectrum": ip_integral_tau_A,
+            "Ip_integral_plasma_time_positive_C_for_spectrum": ip_integral_time_C,
+        }
+
     def toggle_display_time_mode(self):
         self.display_time_mode = DISPLAY_RAW if self.display_time_mode == DISPLAY_SYNC else DISPLAY_SYNC
         self.sync_button.config(text="Display: raw time" if self.display_time_mode == DISPLAY_RAW else "Display: synchronized")
@@ -3219,6 +4251,179 @@ class ShotComparisonTab:
             title="Timing delays relative to Bt start",
             default_filename_base="bt_delays"
         )
+
+    def show_important_data(self):
+        """Show a compact summary table compatible with old and new shots."""
+        if not self.processed_data:
+            return messagebox.showinfo("No data", "Load one or more shots first.")
+        rows = []
+        for d in self.processed_data:
+            try:
+                rows.append(compute_important_data_row(d))
+            except Exception as e:
+                rows.append({
+                    'shot': d.get('shot_number', 'unknown'),
+                    'error': f'{type(e).__name__}: {e}'
+                })
+        df = pd.DataFrame(rows)
+        preferred = [
+            'shot', 'gas', 'pressure_measured_mPa', 'pressure_requested_mPa',
+            'CS_voltage_V', 'TF_voltage_V', 'CS_voltage_source', 'TF_voltage_source', 'I_max_kA', 'I_min_kA',
+            'Bt_max_mT', 'Bt_min_mT', 'qa_min',
+            'duration_preferred_my_method_ms', 'duration_Ip_only_ms', 'duration_MEPhIST_Halpha_method_ms',
+            'plasma_end_method_preferred', 'plasma_end_method_Ip_only', 'plasma_end_halpha_guard_used',
+            'Ip_start_ms', 'Ip_end_ms_preferred', 'Ip_end_ms_Ip_only', 'Halpha_official_start_ms',
+            'Halpha_official_end_ms', 'CS_current_min_kA', 'CS_current_max_kA',
+            'TF_current_min_kA', 'TF_current_max_kA', 'loader_mode',
+            'spectrum_source', 'available_spectrum_sources', 'default_spectrum_source', 'missing_signals'
+        ]
+        cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+        self.show_dataframe_window(
+            df[cols],
+            title="Important data",
+            default_filename_base="important_data"
+        )
+
+    def plot_spectrum_sources(self):
+        """Show Avantes and OceanFX spectra separately for loaded shots."""
+        if not self.processed_data:
+            return messagebox.showinfo("No data", "Load one or more shots first.")
+        win = tk.Toplevel(self.app)
+        win.title("Available spectrum sources")
+        win.geometry("1200x750")
+        fig = Figure(figsize=(12, 7), facecolor='white')
+        ax = fig.add_subplot(111)
+        for idx, d in enumerate(self.processed_data):
+            base_color = self.get_color_for_data(d, fallback_index=idx)
+            label = self.get_plot_label_for_data(d)
+            spectra = d.get('spectra_by_source', {})
+            for j, (key, s) in enumerate(spectra.items()):
+                wl = np.asarray(s.get('wavelengths', np.array([])), dtype=float)
+                raw = np.asarray(s.get('intensity_raw', np.array([])), dtype=float)
+                if wl.size == raw.size and wl.size > 2:
+                    mask = np.isfinite(wl) & np.isfinite(raw) & (wl >= 350.0) & (wl <= 900.0)
+                    if np.any(mask):
+                        linestyle = '-' if key.lower().startswith('ocean') else '--'
+                        alpha = 0.95 if key.lower().startswith('ocean') else 0.75
+                        ax.plot(wl[mask], raw[mask], linestyle=linestyle, alpha=alpha, label=f'{label} {key}')
+        ax.set_title('Available raw spectra: OceanFX and Avantes')
+        ax.set_xlabel('wavelength [nm]')
+        ax.set_ylabel('intensity [counts]')
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8, loc='best')
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        toolbar = NavigationToolbar2Tk(canvas, win)
+        toolbar.update()
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def plot_official_style_diagnostics(self):
+        """Plot official-style diagnostics including raw OceanFX/Avantes spectrum."""
+        if not self.processed_data:
+            return messagebox.showinfo("No data", "Load one or more shots first.")
+
+        win = tk.Toplevel(self.app)
+        win.title("Official-style diagnostics")
+        win.geometry("1350x950")
+
+        fig = Figure(figsize=(13, 9), facecolor='white')
+        gs = fig.add_gridspec(3, 2, height_ratios=[1.0, 1.0, 1.05])
+        ax_ip = fig.add_subplot(gs[0, 0])
+        ax_ha = fig.add_subplot(gs[0, 1])
+        ax_coils = fig.add_subplot(gs[1, 0])
+        ax_bt = fig.add_subplot(gs[1, 1])
+        ax_spec = fig.add_subplot(gs[2, :])
+
+        for idx, d in enumerate(self.processed_data):
+            color = self.get_color_for_data(d, fallback_index=idx)
+            label = self.get_plot_label_for_data(d)
+            Time_ms = np.asarray(d.get('Time', np.array([])), dtype=float) * 1000.0
+            if Time_ms.size == 0:
+                continue
+
+            # Panel 1: Ip and loop voltage.
+            Ip_kA = np.asarray(d.get('Ip', np.zeros_like(Time_ms)), dtype=float) / 1000.0
+            ax_ip.plot(Time_ms, Ip_kA, color=color, label=f'Ip {label}')
+            vloop = np.asarray(d.get('Vloop_2_7_V', np.array([])), dtype=float)
+            if vloop.size == Time_ms.size and np.any(np.isfinite(vloop)):
+                ax_ip_2 = getattr(ax_ip, '_right_axis', None)
+                if ax_ip_2 is None:
+                    ax_ip_2 = ax_ip.twinx()
+                    ax_ip._right_axis = ax_ip_2
+                    ax_ip_2.set_ylabel('(VL2+VL7)/2 [V]')
+                ax_ip_2.plot(Time_ms, vloop, color=color, linestyle='--', alpha=0.7, label=f'(VL2+VL7)/2 {label}')
+
+            # Panel 2: H-alpha/visible emission. Use positive official-style signal.
+            ha = np.asarray(d.get('Photod', np.zeros_like(Time_ms)), dtype=float)
+            ax_ha.plot(Time_ms, ha, color=color, label=label)
+
+            # Panel 3: CS and PF currents.
+            cs = np.asarray(d.get('CS_current_kA', np.array([])), dtype=float)
+            if cs.size == Time_ms.size:
+                ax_coils.plot(Time_ms, cs, color=color, label=f'CS {label}')
+            pf1 = np.asarray(d.get('PF1_current_kA', np.array([])), dtype=float)
+            pf2 = np.asarray(d.get('PF2_current_kA', np.array([])), dtype=float)
+            pf3 = np.asarray(d.get('PF3_current_kA', np.array([])), dtype=float)
+            pf4 = np.asarray(d.get('PF4_current_kA', np.array([])), dtype=float)
+            if pf1.size == Time_ms.size and pf2.size == Time_ms.size:
+                ax_coils.plot(Time_ms, 5.0 * (pf1 + pf2) / 2.0, color=color, linestyle='--', alpha=0.75, label=f'PF1/2 x5 {label}')
+            if pf3.size == Time_ms.size and pf4.size == Time_ms.size:
+                ax_coils.plot(Time_ms, 5.0 * (pf3 + pf4) / 2.0, color=color, linestyle=':', alpha=0.85, label=f'PF3/4 x5 {label}')
+
+            # Panel 4: toroidal magnetic field.
+            bt = np.asarray(d.get('B_phi', np.array([])), dtype=float)
+            if bt.size == Time_ms.size:
+                ax_bt.plot(Time_ms, bt, color=color, label=label)
+
+            # Panel 5: raw survey visible spectrum. This intentionally does NOT
+            # use tau/current normalization, so it resembles the official viewer.
+            wl, spec_raw, spec_label, spec_key = self.get_selected_spectrum_arrays(d, use_rw=False)
+            if wl.size == spec_raw.size and wl.size > 2:
+                mask = np.isfinite(wl) & np.isfinite(spec_raw) & (wl >= 350.0) & (wl <= 900.0)
+                if np.any(mask):
+                    ax_spec.plot(wl[mask], spec_raw[mask], color=color, label=f'{label} ({spec_label})')
+
+        ax_ip.set_title('Plasma current and loop voltage')
+        ax_ip.set_xlabel('time [ms]')
+        ax_ip.set_ylabel('Ip [kA]')
+        ax_ip.grid(True, alpha=0.3)
+        ax_ip.legend(fontsize=8, loc='best')
+        if getattr(ax_ip, '_right_axis', None) is not None:
+            ax_ip._right_axis.legend(fontsize=8, loc='upper right')
+
+        ax_ha.set_title('H-alpha / visible emission')
+        ax_ha.set_xlabel('time [ms]')
+        ax_ha.set_ylabel('relative intensity [a.u.]')
+        ax_ha.grid(True, alpha=0.3)
+        ax_ha.legend(fontsize=8, loc='best')
+
+        ax_coils.set_title('CS and PF coils currents')
+        ax_coils.set_xlabel('time [ms]')
+        ax_coils.set_ylabel('current [kA]')
+        ax_coils.grid(True, alpha=0.3)
+        ax_coils.legend(fontsize=8, loc='best')
+
+        ax_bt.set_title('Toroidal magnetic field')
+        ax_bt.set_xlabel('time [ms]')
+        ax_bt.set_ylabel('Bt [mT]')
+        ax_bt.grid(True, alpha=0.3)
+        ax_bt.legend(fontsize=8, loc='best')
+
+        ax_spec.set_title(f'Survey visible spectrum, raw counts ({getattr(self, "spectrum_source_mode", "Auto")})')
+        ax_spec.set_xlabel('wavelength [nm]')
+        ax_spec.set_ylabel('intensity [counts]')
+        ax_spec.grid(True, alpha=0.3)
+        ax_spec.legend(fontsize=8, loc='best')
+
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        toolbar = NavigationToolbar2Tk(canvas, win)
+        toolbar.update()
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        canvas.draw()
 
     def show_spectroscopy_filter_options(self):
         """
@@ -3540,6 +4745,7 @@ class ShotComparisonTab:
             float(self.nist_match_tolerance_nm),
             float(self.nist_min_relative_peak_height),
             float(self.nist_noise_sigma_factor),
+            str(getattr(self, 'spectrum_source_mode', 'Auto')),
             calibration_key,
         )
 
@@ -3556,7 +4762,7 @@ class ShotComparisonTab:
 
     def get_matching_spectrum_arrays(self, data):
         """Return wavelength/intensity arrays used by the spectroscopy matcher."""
-        wl, intensity_norm, spec_meta = get_spectroscopy_rw_normalized_arrays(data)
+        wl, intensity_norm, spec_meta = self.get_selected_spectroscopy_rw_normalized_arrays(data)
         wl = self.apply_spectroscopy_calibration_to_wavelengths(data, wl)
         if getattr(self, "spectroscopy_calibration_enabled", False) and data.get('spectroscopy_calibration_enabled', False):
             spec_meta = dict(spec_meta)
@@ -3571,7 +4777,7 @@ class ShotComparisonTab:
         uncalibrated experimental spectrum and fits:
             lambda_NIST = poly(lambda_measured)
         """
-        wl_raw, intensity_norm, spec_meta = get_spectroscopy_rw_normalized_arrays(data)
+        wl_raw, intensity_norm, spec_meta = self.get_selected_spectroscopy_rw_normalized_arrays(data)
         wl_raw = np.asarray(wl_raw, dtype=float)
         intensity_norm = np.asarray(intensity_norm, dtype=float)
 
@@ -3774,7 +4980,7 @@ class ShotComparisonTab:
         exclusion_half_width_nm = float(SPECTROSCOPY_ACCEPTED_LINE_EXCLUSION_HALF_WIDTH_NM)
 
         for shot_order, data in enumerate(self.processed_data):
-            wl_raw_for_match, _, _ = get_spectroscopy_rw_normalized_arrays(data)
+            wl_raw_for_match, _, _ = self.get_selected_spectroscopy_rw_normalized_arrays(data)
             wl, intensity_norm, spec_meta = self.get_matching_spectrum_arrays(data)
             shot = data.get('shot_number', '')
             if len(wl) == 0 or len(intensity_norm) == 0:
@@ -5704,6 +6910,14 @@ class ShotComparisonTab:
         return xb, yb, xi, yi, xh, yh
 
     def get_display_spectrum_arrays(self, data):
+        wl_raw, spec_raw, source_label, source_key = self.get_selected_spectrum_arrays(data, use_rw=False)
+        wl_raw = np.asarray(wl_raw, dtype=float)
+        spec_raw = np.asarray(spec_raw, dtype=float)
+
+        if getattr(self, "spectrum_display_mode", "raw") == "raw":
+            wl = self.apply_spectroscopy_calibration_to_wavelengths(data, wl_raw)
+            return wl, spec_raw
+
         tau, plasma_duration, active_mask, tau_active, Ip_active = get_tau_active_and_ip(
             data['Time'],
             data['Ip'],
@@ -5712,7 +6926,6 @@ class ShotComparisonTab:
         )
 
         time_active = data['Time'][active_mask]
-
         ip_norm = get_ip_normalization_factor(
             tau_active,
             Ip_active,
@@ -5721,8 +6934,8 @@ class ShotComparisonTab:
         )
 
         wl, spec_y = get_normalized_spectrum(
-            data['wavelengths_Avantes'],
-            data['intensities_Avantes_raw'],
+            wl_raw,
+            spec_raw,
             plasma_duration,
             self.normalization_mode,
             ip_norm
