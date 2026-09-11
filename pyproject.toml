@@ -15,6 +15,7 @@ dependencies = [
     "mephistdatakit",
     "opencv-python>=4.13.0.92",
     "pyyaml>=6.0.3",
+    "openpyxl>=3.1.5",
 ]
 
 [tool.uv.sources]
