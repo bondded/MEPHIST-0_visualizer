@@ -1389,6 +1389,78 @@ def representative_max(time, signal_data, smooth_us=IP_REPRESENTATIVE_SMOOTH_US)
     return float(np.max(positive_values)) if positive_values.size > 0 else float(np.max(signal_smooth))
 
 # --- Sync Functions ---
+def read_recorded_sync_pulse(file_path):
+    """Read the recorded Service/Sync voltage with its OWN stored time array.
+
+    The timing generator configuration in PowSync/sync_tang is not an
+    oscillogram and is deliberately not used to locate the measured edge.
+    Times returned here are in milliseconds, as specified by the dataset's
+    units attribute; no shot-dependent correction is inferred.
+    """
+    with h5py.File(file_path, 'r') as shot:
+        group = shot.get('service/sync') or shot.get('Service/Sync')
+        if group is None or 'time' not in group or 'data' not in group:
+            raise ValueError('Esta descarga no contiene service/sync/{time,data}.')
+        t_dataset, y_dataset = group['time'], group['data']
+        t = np.asarray(t_dataset[()], dtype=float).ravel()
+        y = np.asarray(y_dataset[()], dtype=float).ravel()
+        if t.size < 12 or t.size != y.size:
+            raise ValueError('El pulso de sincronización no tiene muestras válidas.')
+
+        def _attr(dataset, name):
+            value = dataset.attrs.get(name, '')
+            return value.decode('utf-8', errors='replace') if isinstance(value, bytes) else str(value)
+
+        units = _attr(t_dataset, 'units').strip().lower()
+        factors = {'ms': 1.0, 'millisecond': 1.0, 's': 1000.0,
+                   'sec': 1000.0, 'us': 0.001, 'µs': 0.001, 'μs': 0.001}
+        if units not in factors:
+            raise ValueError(f'Unidad de tiempo no reconocida para service/sync: {units!r}')
+        t_ms = t * factors[units]
+        if not np.all(np.isfinite(t_ms)) or not np.all(np.diff(t_ms) > 0):
+            raise ValueError('El tiempo de service/sync no es creciente y finito.')
+        return {
+            'time_ms': t_ms, 'voltage_v': y,
+            'data_pv': _attr(y_dataset, 'pv_name'),
+            'time_pv': _attr(t_dataset, 'pv_name'),
+            'sample_step_us': float(np.median(np.diff(t_ms))) * 1000.0,
+        }
+
+
+def detect_recorded_sync_edge(time_ms, voltage_v, fraction=0.05, hold_samples=3):
+    """First sustained crossing of a fraction of the leading pulse excursion.
+
+    The pre-edge baseline is restricted to the first 32 samples for the 2025
+    Owon record (the rise starts near sample 35). A different threshold gives
+    a different time on its slow edge; the result is an operational marker,
+    not a calibrated ADC-to-oscilloscope delay.
+    """
+    t = np.asarray(time_ms, dtype=float)
+    y = np.asarray(voltage_v, dtype=float)
+    if t.size < 12 or t.size != y.size or not 0 < fraction < 1:
+        raise ValueError('Pulso o fracción de umbral no válidos.')
+    n_base = min(32, max(5, t.size // 20))
+    baseline = float(np.nanmedian(y[:n_base]))
+    leading = y[:min(t.size, max(80, t.size // 5))]
+    up = float(np.nanpercentile(leading, 95)) - baseline
+    down = baseline - float(np.nanpercentile(leading, 5))
+    sign = 1.0 if up >= down else -1.0
+    amplitude = max(up, down)
+    if not np.isfinite(amplitude) or amplitude <= 0:
+        raise ValueError('No se distingue un pulso de sincronización.')
+    threshold = baseline + sign * float(fraction) * amplitude
+    crossings = (sign * (y - threshold) >= 0) & np.isfinite(y)
+    limit = min(t.size - hold_samples + 1, max(80, t.size // 3))
+    index = next((i for i in range(n_base, limit)
+                  if np.all(crossings[i:i + hold_samples])), None)
+    if index is None:
+        raise ValueError('No hay cruce sostenido del umbral en el primer pulso.')
+    return {'index': index, 'time_ms': float(t[index]),
+            'voltage_v': float(y[index]), 'baseline_v': baseline,
+            'threshold_v': threshold, 'amplitude_v': amplitude,
+            'fraction': float(fraction)}
+
+
 def find_bt_reference_time(Time, B_phi, threshold_ratio=BT_START_THRESHOLD_RATIO):
     Time, B_phi = np.asarray(Time), np.asarray(B_phi)
     if len(Time) == 0 or len(B_phi) == 0: return 0.0
@@ -2462,6 +2534,26 @@ def get_normalized_temporal_signal(
         return x, safe_divide(y_to_normalize, factor)
 
     return x_raw, signal_data
+
+
+def resample_time_shifted_signal(time_s, signal, shift_ms):
+    """Evaluate a display-only left translation on the unmodified time grid.
+
+    Hα_corrected(t) = Hα_recorded(t + shift). This interpolation must happen
+    before the Ip active-window clipping and amplitude normalization, otherwise
+    changing to τ silently discards the timing correction.
+    """
+    time_s = np.asarray(time_s, dtype=float)
+    signal = np.asarray(signal, dtype=float)
+    if time_s.size != signal.size:
+        raise ValueError('Hα y su eje temporal tienen longitudes diferentes.')
+    if not shift_ms:
+        return signal
+    valid = np.isfinite(time_s) & np.isfinite(signal)
+    if np.count_nonzero(valid) < 2:
+        return np.full_like(time_s, np.nan)
+    return np.interp(time_s + float(shift_ms)*1e-3,
+                     time_s[valid], signal[valid], left=np.nan, right=np.nan)
 
 def get_normalized_spectrum(wavelengths, intensity_raw, plasma_duration, mode, ip_normalization_factor=1.0):
     wavelengths, intensity_raw = np.asarray(wavelengths), np.asarray(intensity_raw)
@@ -6959,6 +7051,230 @@ def build_halpha_video_sync_candidates(
     return evaluated
 
 
+def analyze_halpha_video_alignment(data, video_info, frame_interval_us,
+                                   halpha_display_shift_ms=0.0,
+                                   sync_with_halpha=True):
+    """Shared camera/Hα episode detection and ranking for both video views.
+
+    Camera cadence is the physical frame interval, never the encoded playback
+    rate. A trial Hα calibration changes its plotted time, not its samples.
+    """
+    time = np.asarray(data.get('Time', []), dtype=float)
+    halpha = np.asarray(data.get('Photod', []), dtype=float)
+    if time.size != halpha.size or time.size < 5:
+        raise ValueError('La descarga no contiene Hα y tiempo compatibles.')
+    ip_start = float(data.get('Ip_start_time_Ip_only',
+                              data.get('Ip_start_time', np.nan)))
+    if not np.isfinite(ip_start):
+        raise ValueError('No se pudo determinar el inicio de Ip.')
+    ip_end = float(data.get('Ip_end_time_ip_only', np.nan))
+    duration = ((ip_end - ip_start) * 1000.0
+                if np.isfinite(ip_end) and ip_end > ip_start else np.nan)
+    frame_interval_ms = float(frame_interval_us) / 1000.0
+    if not np.isfinite(frame_interval_ms) or frame_interval_ms <= 0:
+        raise ValueError('El intervalo físico entre fotogramas debe ser positivo.')
+    diagnostic_time_ms = (time - ip_start) * 1000.0
+    optical_time_ms = diagnostic_time_ms - float(halpha_display_shift_ms)
+    light_info = detect_video_light_window(
+        video_info['frame_sums'], frame_interval_ms=frame_interval_ms,
+        target_duration_ms=duration)
+    red_sums = np.asarray(video_info.get('red_frame_sums', []), dtype=float)
+    red_light_info = (detect_video_light_window(
+        red_sums, frame_interval_ms=frame_interval_ms,
+        target_duration_ms=duration) if red_sums.size else None)
+    halpha_info = detect_halpha_with_video_method(
+        optical_time_ms, halpha, frame_interval_ms=frame_interval_ms,
+        target_duration_ms=duration)
+    halpha_grid = np.asarray(halpha_info['time_grid_ms'], dtype=float)
+    halpha_corrected = np.asarray(halpha_info['corrected_luminosity'], dtype=float)
+    if not halpha_grid.size:
+        raise ValueError('No se pudo detectar un episodio Hα.')
+    halpha_start = float(halpha_grid[int(halpha_info['start_idx'])])
+    halpha_end = float(halpha_grid[int(halpha_info['end_idx'])])
+    corrected = np.asarray(light_info['corrected_luminosity'], dtype=float)
+    if sync_with_halpha:
+        candidates = build_halpha_video_sync_candidates(
+            halpha_grid, halpha_corrected, frame_interval_ms, corrected,
+            light_info, halpha_start, halpha_end,
+            max(halpha_end-halpha_start, 0.0),
+            red_corrected=(np.asarray(red_light_info['corrected_luminosity'], dtype=float)
+                           if red_light_info is not None else None),
+            max_candidates=VIDEO_MAX_SYNC_CANDIDATES)
+    else:
+        start_idx = int(light_info['start_idx'])
+        end_idx = int(light_info['end_idx'])
+        base_time = (np.arange(corrected.size)-start_idx)*frame_interval_ms
+        alignment = {'shift_ms': 0.0, 'correlation': np.nan,
+                     'method': 'ip_only_start_alignment'}
+        candidates = [{
+            'rank': 1, 'episode_number': 1, 'start_idx': start_idx,
+            'end_idx': end_idx, 'duration_ms': (end_idx-start_idx)*frame_interval_ms,
+            'halpha_duration_error_ratio': np.nan,
+            'base_video_time_ms': base_time, 'video_time_ms': base_time,
+            'alignment_info': alignment,
+            'alignment_signal_label': 'Ip-only reference (no optical correlation)',
+            'alignment_shift_ms': 0.0, 'correlation': np.nan,
+            'red_alignment_info': {'shift_ms': np.nan, 'correlation': np.nan,
+                                   'method': 'not_requested'},
+            'total_alignment_info': alignment,
+        }]
+    if not candidates:
+        raise ValueError('No hay candidatos válidos de sincronización Hα/video.')
+    return {
+        'candidates': candidates, 'light_info': light_info,
+        'red_light_info': red_light_info, 'halpha_light_info': halpha_info,
+        'halpha_grid_ms': halpha_grid, 'halpha_corrected': halpha_corrected,
+        'halpha_start_ms': halpha_start, 'halpha_end_ms': halpha_end,
+        'diagnostic_time_ms': diagnostic_time_ms, 'optical_time_ms': optical_time_ms,
+        'target_ip_duration_ms': duration, 'frame_interval_ms': frame_interval_ms,
+    }
+
+
+# =========================================================
+# INTERACTIVE MEASUREMENT (MAIN AND OVERLAID FIGURES)
+# =========================================================
+def _nearest_plotted_line(event, lines, max_distance_px=12.0):
+    """Find a trace near a click, including either side of a twinned y axis."""
+    if event.x is None or event.y is None:
+        return None
+    best = None
+    for line in lines:
+        try:
+            if not line.get_visible() or line.axes is None:
+                continue
+            x = np.asarray(line.get_xdata(), dtype=float)
+            y = np.asarray(line.get_ydata(), dtype=float)
+            if x.size < 2 or x.size != y.size:
+                continue
+            data_x = line.axes.transData.inverted().transform((event.x, event.y))[0]
+            if not np.isfinite(data_x) or data_x < np.nanmin(x) or data_x > np.nanmax(x):
+                continue
+            idx = int(np.searchsorted(x, data_x))
+            candidates = np.arange(max(0, idx - 4), min(x.size, idx + 5))
+            candidates = candidates[np.isfinite(x[candidates]) & np.isfinite(y[candidates])]
+            if not candidates.size:
+                continue
+            xy = line.axes.transData.transform(np.column_stack((x[candidates], y[candidates])))
+            distances = np.hypot(xy[:, 0] - event.x, xy[:, 1] - event.y)
+            nearest = int(np.argmin(distances))
+            distance = float(distances[nearest])
+            if distance <= max_distance_px and (best is None or distance < best[0]):
+                point_idx = int(candidates[nearest])
+                best = (distance, line, float(x[point_idx]), float(y[point_idx]))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return best
+
+
+class PlotRuler:
+    """Measure two points on one axis; the horizontal unit follows its x scale."""
+
+    def __init__(self, canvas, toolbar, snap_lines=None):
+        self.canvas = canvas
+        self.toolbar = toolbar
+        self.snap_lines = snap_lines or (lambda: [])
+        self.active = False
+        self.first = None
+        self.artists = []
+        self.text = tk.StringVar(master=toolbar, value="")
+
+        # Create a small ruler pictogram without loading any external assets.
+        self.icon = tk.PhotoImage(master=toolbar, width=24, height=24)
+        self.icon.put('#d9a717', to=(2, 7, 22, 18))
+        self.icon.put('#ffe079', to=(3, 8, 21, 17))
+        for position in (5, 8, 11, 14, 17, 20):
+            height = 6 if position in (5, 11, 17) else 3
+            self.icon.put('#593f10', to=(position, 8, position + 1, 8 + height))
+        self.button = tk.Button(
+            toolbar, image=self.icon, text=" Regla", compound=tk.LEFT,
+            command=self.toggle, relief=tk.RAISED, padx=2,
+        )
+        self.button.pack(side=tk.LEFT, padx=(5, 1))
+        self.readout = tk.Label(toolbar, textvariable=self.text, anchor='w')
+        self.readout.pack(side=tk.LEFT, padx=(2, 6))
+        self.cid = canvas.mpl_connect('button_press_event', self.on_click)
+
+    def toggle(self):
+        self.active = not self.active
+        self.button.configure(relief=tk.SUNKEN if self.active else tk.RAISED)
+        self.clear()
+        if self.active:
+            self.text.set('Regla: elige dos puntos en el mismo eje')
+
+    def clear(self):
+        self.first = None
+        for artist in self.artists:
+            try:
+                artist.remove()
+            except (ValueError, AttributeError):
+                pass
+        self.artists.clear()
+        self.text.set('')
+        self.canvas.draw_idle()
+
+    def reset_for_redraw(self):
+        self.clear()
+        if self.active:
+            self.text.set('Regla: elige dos puntos en el mismo eje')
+
+    def on_click(self, event):
+        if not self.active or event.button != 1 or event.inaxes is None:
+            return
+        if getattr(self.toolbar, 'mode', None):
+            self.text.set('Desactiva zoom o desplazamiento antes de medir')
+            return
+
+        hit = _nearest_plotted_line(event, self.snap_lines())
+        if hit is not None:
+            _, line, x, y = hit
+            axis = line.axes
+        else:
+            axis, x, y = event.inaxes, event.xdata, event.ydata
+        if x is None or y is None or not np.isfinite((x, y)).all():
+            return
+
+        if self.first is not None and self.first[0] is not axis:
+            self.text.set('Elige dos puntos del mismo eje y señal para medir amplitud')
+            return
+        if self.first is None:
+            self.clear()
+            self.first = (axis, float(x), float(y))
+            marker, = axis.plot([x], [y], 'o', color='#e64b00', markersize=6,
+                                zorder=200, label='_nolegend_')
+            self.artists.append(marker)
+            self.text.set('Primer punto elegido: selecciona el segundo')
+        else:
+            _, x0, y0 = self.first
+            dx, dy = float(x) - x0, float(y) - y0
+            line, = axis.plot([x0, x], [y0, y], color='#e64b00', lw=1.8,
+                              zorder=199, label='_nolegend_')
+            horizontal, = axis.plot([x0, x], [y0, y0], '--', color='#e64b00',
+                                    lw=1.2, label='_nolegend_')
+            vertical, = axis.plot([x, x], [y0, y], '--', color='#e64b00',
+                                  lw=1.2, label='_nolegend_')
+            marker, = axis.plot([x], [y], 'o', color='#e64b00', markersize=6,
+                                zorder=200, label='_nolegend_')
+            x_label = axis.get_xlabel().lower()
+            x_unit = 'nm' if 'nm' in x_label else ('τ' if 'tau' in x_label or 'τ' in x_label else 'ms')
+            x_delta_name = 'Δλ' if x_unit == 'nm' else ('Δτ' if x_unit == 'τ' else 'Δt')
+            y_label = axis.get_ylabel().strip()
+            y_unit = (y_label.rsplit('[', 1)[-1].rstrip(']') if '[' in y_label
+                      else 'normalizado' if 'norm' in y_label.lower() or 'int(' in y_label.lower()
+                      else 'u.a.')
+            readout = (f'{x_delta_name}={dx:+.5g} {x_unit} '
+                       f'(|{x_delta_name}|={abs(dx):.5g}); Δy={dy:+.5g} {y_unit}')
+            note = axis.annotate(
+                readout, (x, y), xytext=(8, 10), textcoords='offset points',
+                fontsize=9, color='#9b2b00',
+                bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#e64b00', alpha=.95),
+                zorder=201,
+            )
+            self.artists.extend((line, horizontal, vertical, marker, note))
+            self.text.set(readout)
+            self.first = None
+        self.canvas.draw_idle()
+
+
 # =========================================================
 # MODULAR TAB CLASS
 # =========================================================
@@ -6977,6 +7293,14 @@ class ShotComparisonTab:
 
         self.file_paths = []
         self.processed_data = []
+        # Selection, visibility and highlighting are view state; never mutate
+        # processed_data when hiding a shot.  The absolute file path is the key
+        # because the same shot number may occur in different folders.
+        self.selected_shot_keys = set()
+        self.isolated_shot_keys = None
+        self.highlighted_shot_keys = set()
+        self.legend_shot_targets = []
+        self.main_ruler = None
 
         self.normalization_mode = NORMALIZATION_NONE
         self.display_time_mode = DISPLAY_SYNC
@@ -6985,6 +7309,16 @@ class ShotComparisonTab:
         self.plot_font_var = None
         self.plot_text_scale_var = None
         self._video_comparison_windows = []
+        # Exploration-only timing corrections. Raw NXS signals and the event
+        # detector's stored results are never overwritten.
+        self.halpha_display_shift_ms = {}
+        self.sync_onset_choices = {}
+        self._sync_pulse_cache = {}
+        self._sync_halpha_start_cache = {}
+        self._sync_window = None
+        self.show_halpha_raw_comparison = False
+        self._video_panel_cards = {}
+        self._video_panel_visible = False
 
         # Bottom information panel shown inside the Matplotlib toolbar.
         # It can become very tall when many shots are loaded and a normalization
@@ -7209,22 +7543,44 @@ class ShotComparisonTab:
         self.spectrum_display_button.pack(side=tk.LEFT, padx=2, pady=2)
 
 
-        # Main panel selector. Compact checkbuttons avoid adding many extra
-        # action buttons and let the user enlarge a subset of plots.
+        # A real menu keeps the checkmarks while freeing toolbar space. Video
+        # opens an independently scrollable pane next to the diagnostic plots.
         tk.Label(self.top_button_frame2, text="Plots:", bg="#f0f0f0").pack(side=tk.LEFT, padx=(8, 2), pady=2)
         self.main_plot_panel_vars = {}
+        self.plots_menu_button = tk.Menubutton(
+            self.top_button_frame2, text="Gráficos ▾", relief=tk.RAISED,
+            bg="#eeeeee", width=22, anchor="w"
+        )
+        self.plots_menu_button.pack(side=tk.LEFT, padx=2, pady=2)
+        self.plots_menu = tk.Menu(self.plots_menu_button, tearoff=0)
+        self.plots_menu_button.configure(menu=self.plots_menu)
         for _key, _label in [("Ip", "Ip"), ("LV", "LV"), ("Bt", "Bt"), ("coils", "coils"), ("spectrum", "spectrum"), ("H_alpha", "Hα")]:
             _var = tk.BooleanVar(value=bool(self.main_plot_default_panels.get(_key, False)))
             self.main_plot_panel_vars[_key] = _var
-            tk.Checkbutton(
-                self.top_button_frame2,
-                text=_label,
-                variable=_var,
-                command=self.on_main_plot_panel_changed,
-                bg="#f0f0f0",
-                padx=1,
-                pady=0
-            ).pack(side=tk.LEFT, padx=1, pady=2)
+            self.plots_menu.add_checkbutton(
+                label=_label, variable=_var, command=self.on_main_plot_panel_changed
+            )
+        self.main_plot_panel_vars['video'] = tk.BooleanVar(value=False)
+        self.plots_menu.add_checkbutton(
+            label='Video (panel derecho)', variable=self.main_plot_panel_vars['video'],
+            command=self.on_main_plot_panel_changed
+        )
+        self.plots_menu.add_separator()
+        self.show_halpha_raw_var = tk.BooleanVar(value=self.show_halpha_raw_comparison)
+        self.plots_menu.add_checkbutton(
+            label='Mostrar Hα original punteada',
+            variable=self.show_halpha_raw_var,
+            command=self.on_halpha_raw_comparison_changed)
+        self.plots_menu.add_command(label='Sincronización…', command=self.open_sync_inspector)
+        self._update_plots_menu_label()
+        tk.Button(
+            self.top_button_frame2, text='Sincronización…',
+            command=self.open_sync_inspector, bg='#d9edf7'
+        ).pack(side=tk.LEFT, padx=3, pady=2)
+        tk.Button(
+            self.top_button_frame2, text='Sincronización rápida Hα',
+            command=self.quick_sync_halpha, bg='#d8f3dc'
+        ).pack(side=tk.LEFT, padx=3, pady=2)
 
         self.show_ip_window_var = tk.BooleanVar(value=bool(getattr(self, "show_ip_start_end_markers", True)))
         tk.Checkbutton(
@@ -7384,6 +7740,8 @@ class ShotComparisonTab:
         self.plot_frame = tk.Frame(self.main_frame, bg="white")
         self.plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
+        self._create_video_side_panel()
+
         self.fig = Figure(figsize=(10, 8), facecolor='white')
         self.rebuild_plot_axes()
 
@@ -7393,6 +7751,13 @@ class ShotComparisonTab:
         self.toolbar.update()
         self.toolbar.pack(side=tk.BOTTOM, fill=tk.X)
         canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        self.main_ruler = PlotRuler(
+            self.canvas, self.toolbar, snap_lines=lambda: self.hover_lines
+        )
+        self.context_cid = self.canvas.mpl_connect(
+            'button_press_event', self.on_main_plot_button_press
+        )
 
         self.data_box_close_button = tk.Button(
             self.toolbar,
@@ -7419,6 +7784,9 @@ class ShotComparisonTab:
         # the checkbox is disabled. This keeps it compatible with redraws, zoom
         # and the existing cursor-dynamics callback.
         self.hover_cid = self.canvas.mpl_connect('motion_notify_event', self.on_line_hover_move)
+        self.video_cursor_cid = self.canvas.mpl_connect(
+            'motion_notify_event', self._on_video_panel_cursor_motion
+        )
 
         self.connect_xlim_sync_callbacks()
         self.canvas.draw()
@@ -7510,14 +7878,543 @@ class ShotComparisonTab:
         return selected
 
     def on_main_plot_panel_changed(self):
-        """Refresh the main figure when the user changes panel checkboxes."""
+        """Update checked plot panels and the independent video sidebar."""
         # Make sure at least one panel remains visible.
         if not self.get_selected_main_plot_keys():
             try:
                 self.main_plot_panel_vars["Ip"].set(True)
             except Exception:
                 pass
+        self._update_plots_menu_label()
+        self._toggle_video_side_panel()
         self.plot_data()
+
+    def _update_plots_menu_label(self):
+        count = sum(bool(var.get()) for var in self.main_plot_panel_vars.values())
+        if hasattr(self, 'plots_menu_button'):
+            self.plots_menu_button.configure(text=f'Gráficos ▾  ({count} seleccionados)')
+
+    def on_halpha_raw_comparison_changed(self):
+        self.show_halpha_raw_comparison = bool(self.show_halpha_raw_var.get())
+        self._plot_data_preserving_view()
+
+    def quick_sync_halpha(self):
+        """Per-shot Owon pulse edge, applied only as a reversible Hα view shift."""
+        if not self.processed_data:
+            messagebox.showinfo('Sincronización rápida Hα',
+                                'Cargue primero las descargas 26xx.',
+                                parent=self.master_frame)
+            return
+        shifted, skipped = [], []
+        for data in self.processed_data:
+            shot = self._normalized_shot_id(data.get('shot_number', ''))
+            if not shot.isdigit() or not 2600 <= int(shot) < 2700:
+                continue
+            pulse = self._get_sync_pulse_for_data(data)
+            if not pulse.get('same_owon_timebase', False):
+                skipped.append(shot)
+                continue
+            try:
+                edge = self._sync_edge_for_data(data)
+                self.halpha_display_shift_ms[self.shot_key(data)] = edge['time_ms']
+                shifted.append(shot)
+            except ValueError:
+                skipped.append(shot)
+        if shifted:
+            self._plot_data_preserving_view()
+        summary = (f'{len(shifted)} descarga(s) 26xx: prueba visual Hα(t−borde Owon). '
+                   'El borde elegido se puede revisar en Sincronización; '
+                   'no es una calibración exacta entre ADCs.')
+        if skipped:
+            summary += f' Sin eje Owon/borde compatible: {", ".join(skipped)}.'
+        if not shifted:
+            summary = 'No se encontraron descargas 26xx con pulso y Hα en el mismo eje Owon. ' + summary
+        messagebox.showinfo('Sincronización rápida Hα', summary,
+                            parent=self.master_frame)
+
+    def _get_sync_pulse_for_data(self, data):
+        key = self.shot_key(data)
+        if key not in self._sync_pulse_cache:
+            try:
+                pulse = read_recorded_sync_pulse(data['file_path'])
+                with h5py.File(data['file_path'], 'r') as shot:
+                    h_group = shot.get('spectroscopy/visible_emission')
+                    if h_group is not None and 'time' in h_group:
+                        pv = h_group['time'].attrs.get('pv_name', '')
+                        pulse['halpha_time_pv'] = (
+                            pv.decode('utf-8', errors='replace') if isinstance(pv, bytes)
+                            else str(pv)
+                        )
+                    else:
+                        pulse['halpha_time_pv'] = ''
+                pulse['same_owon_timebase'] = (
+                    pulse['time_pv'].lower().startswith('owon')
+                    and pulse['time_pv'] == pulse['halpha_time_pv']
+                )
+                self._sync_pulse_cache[key] = pulse
+            except (OSError, ValueError, KeyError) as exc:
+                self._sync_pulse_cache[key] = {'error': str(exc)}
+        return self._sync_pulse_cache[key]
+
+    def _sync_edge_for_data(self, data, fraction=0.05):
+        pulse = self._get_sync_pulse_for_data(data)
+        if 'error' in pulse:
+            raise ValueError(pulse['error'])
+        choice = self.sync_onset_choices.get(self.shot_key(data), {})
+        if choice.get('mode') == 'manual':
+            index = int(choice['index'])
+            if 0 <= index < pulse['time_ms'].size:
+                return {'index': index, 'time_ms': float(pulse['time_ms'][index]),
+                        'voltage_v': float(pulse['voltage_v'][index]),
+                        'fraction': np.nan, 'mode': 'manual'}
+        selected_fraction = float(choice.get('fraction', fraction))
+        result = detect_recorded_sync_edge(
+            pulse['time_ms'], pulse['voltage_v'], fraction=selected_fraction
+        )
+        result['mode'] = 'automatico'
+        return result
+
+    def _sync_table_record(self, data):
+        """A transparent per-shot timing ledger; measured and trial shifts differ."""
+        key = self.shot_key(data)
+        pulse = self._get_sync_pulse_for_data(data)
+        try:
+            edge = self._sync_edge_for_data(data)
+            edge_us = 1000.0 * edge['time_ms']
+            edge_sample = edge['index']
+            edge_method = (edge['mode'] if edge['mode'] == 'manual'
+                           else f"{100 * edge['fraction']:g}% / 3 muestras")
+        except ValueError:
+            edge_us, edge_sample, edge_method = np.nan, np.nan, ''
+
+        ip_start_ms = float(data.get('Ip_start_time_Ip_only',
+                                     data.get('Ip_start_time', np.nan))) * 1000.0
+        if key not in self._sync_halpha_start_cache:
+            try:
+                h_start_s, _th, h_method = get_halpha_start_5pct_time(
+                    np.asarray(data['Time'], dtype=float),
+                    np.asarray(data['Photod'], dtype=float),
+                    ip_start_ms * 1e-3,
+                    float(data.get('Halpha_end_time', np.nan)),
+                    threshold_ratio=0.05, smooth_us=HALPHA_END_SMOOTH_US,
+                    min_active_us=HALPHA_END_MIN_ACTIVE_US
+                )
+                self._sync_halpha_start_cache[key] = (
+                    float(h_start_s) * 1000.0, h_method
+                )
+            except (ValueError, KeyError):
+                self._sync_halpha_start_cache[key] = (np.nan, 'sin deteccion')
+        h_start_ms, h_method = self._sync_halpha_start_cache[key]
+        applied_us = self.halpha_display_shift_ms.get(key, 0.0) * 1000.0
+        corrected_ms = (h_start_ms - applied_us/1000.0
+                        if np.isfinite(h_start_ms) else np.nan)
+        t_ms = np.asarray(data.get('Time', []), dtype=float) * 1000.0
+        ip_signal = np.asarray(data.get('Ip', []), dtype=float)
+        h_signal = np.asarray(data.get('Photod', []), dtype=float)
+        h_end_ms = float(data.get('Halpha_end_time', np.nan)) * 1000.0
+        ip_end_ms = float(data.get('Ip_end_time', np.nan)) * 1000.0
+
+        def _peak_time(signal, start_ms, end_ms):
+            if signal.size != t_ms.size or t_ms.size == 0:
+                return np.nan
+            mask = (t_ms >= start_ms) & (t_ms <= end_ms) & np.isfinite(signal)
+            if not np.any(mask):
+                return np.nan
+            indices = np.where(mask)[0]
+            return float(t_ms[indices[int(np.argmax(signal[mask]))]])
+
+        ip_peak_ms = _peak_time(ip_signal, ip_start_ms, ip_end_ms)
+        h_peak_ms = _peak_time(h_signal, ip_start_ms,
+                              h_end_ms if np.isfinite(h_end_ms) else ip_end_ms)
+        return {
+            'shot': str(data.get('shot_number', '')),
+            'path': str(data.get('file_path', '')),
+            'sync_pv': pulse.get('data_pv', ''),
+            'sync_time_pv': pulse.get('time_pv', ''),
+            'halpha_time_pv': pulse.get('halpha_time_pv', ''),
+            'same_owon_timebase': bool(pulse.get('same_owon_timebase', False)),
+            'sync_dt_us': pulse.get('sample_step_us', np.nan),
+            'sync_edge_index': edge_sample,
+            'sync_edge_us': edge_us,
+            'sync_edge_method': edge_method,
+            'Ip_start_ms': ip_start_ms,
+            'Ip_peak_ms': ip_peak_ms,
+            'Halpha_start_raw_ms': h_start_ms,
+            'Halpha_peak_raw_ms': h_peak_ms,
+            'Halpha_start_method': h_method,
+            'Halpha_minus_Ip_raw_us': (h_start_ms-ip_start_ms)*1000
+                                      if np.isfinite(h_start_ms) and np.isfinite(ip_start_ms)
+                                      else np.nan,
+            'Halpha_trial_shift_us': applied_us,
+            'Halpha_start_trial_ms': corrected_ms,
+            'Halpha_peak_trial_ms': (h_peak_ms-applied_us/1000.0
+                                      if np.isfinite(h_peak_ms) else np.nan),
+            'Halpha_minus_Ip_trial_us': (corrected_ms-ip_start_ms)*1000
+                                        if np.isfinite(corrected_ms) and np.isfinite(ip_start_ms)
+                                        else np.nan,
+            'error': pulse.get('error', ''),
+        }
+
+    def open_sync_inspector(self):
+        """Inspect Owon's recorded pulse and compare trial H-alpha timing."""
+        if not self.processed_data:
+            return messagebox.showinfo('Sincronización',
+                                       'Cargue primero una o más descargas .nxs.',
+                                       parent=self.master_frame)
+        if self._sync_window is not None:
+            try:
+                if self._sync_window.winfo_exists():
+                    self._sync_window.lift()
+                    self._sync_window.focus_set()
+                    return
+            except tk.TclError:
+                pass
+
+        window = tk.Toplevel(self.master_frame)
+        self._sync_window = window
+        window.title('Sincronización: pulso registrado y calibración de Hα')
+        window.geometry('1330x900')
+        def _close():
+            self._sync_window = None
+            window.destroy()
+        window.protocol('WM_DELETE_WINDOW', _close)
+
+        controls = tk.Frame(window, bg='#eff5fa')
+        controls.pack(fill=tk.X, padx=5, pady=4)
+        labels = [f"{d.get('shot_number', '?')} — "
+                  f"{Path(d.get('file_path', '')).parent.name}/"
+                  f"{Path(d.get('file_path', '')).name}"
+                  for d in self.processed_data]
+        tk.Label(controls, text='Descarga:', bg='#eff5fa').pack(side=tk.LEFT, padx=3)
+        selected_shot = ttk.Combobox(controls, values=labels, state='readonly', width=32)
+        selected_shot.current(0)
+        selected_shot.pack(side=tk.LEFT, padx=3)
+        tk.Label(controls, text='Umbral del pulso:', bg='#eff5fa').pack(side=tk.LEFT, padx=3)
+        threshold_var = tk.StringVar(value='5')
+        threshold_combo = ttk.Combobox(controls, textvariable=threshold_var,
+                                       values=['1', '3', '5', '10', '20', '50'], width=4)
+        threshold_combo.pack(side=tk.LEFT)
+        tk.Label(controls, text='% de la subida', bg='#eff5fa').pack(side=tk.LEFT)
+        label_var = tk.StringVar(value='')
+        tk.Label(window, textvariable=label_var, justify='left', anchor='w',
+                 bg='#fff8e7', wraplength=1290).pack(fill=tk.X, padx=7, pady=3)
+
+        figure = Figure(figsize=(11.4, 5.1), facecolor='white')
+        grid = figure.add_gridspec(3, 1, height_ratios=[1.05, 1.35, 0.72], hspace=0.48)
+        ax_pulse = figure.add_subplot(grid[0, 0])
+        ax_diag = figure.add_subplot(grid[1, 0])
+        ax_optical = ax_diag.twinx()
+        ax_vl = figure.add_subplot(grid[2, 0], sharex=ax_diag)
+        figure.subplots_adjust(left=0.08, right=0.91, top=0.95, bottom=0.10)
+        canvas = FigureCanvasTkAgg(figure, master=window)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=5, pady=2)
+        toolbar = NavigationToolbar2Tk(canvas, window)
+        toolbar.update()
+        toolbar.pack(fill=tk.X)
+
+        trial_frame = tk.Frame(window, bg='#eff5fa')
+        trial_frame.pack(fill=tk.X, padx=5, pady=(4, 2))
+        trial_actions = tk.Frame(window, bg='#eff5fa')
+        trial_actions.pack(fill=tk.X, padx=5, pady=(0, 2))
+        tk.Label(trial_frame, text='Calibrar Hα (prueba): restar', bg='#eff5fa').pack(
+            side=tk.LEFT, padx=(5, 2))
+        shift_var = tk.StringVar(value='350')
+        shift_entry = ttk.Entry(trial_frame, textvariable=shift_var, width=8)
+        shift_entry.pack(side=tk.LEFT)
+        tk.Label(trial_frame, text='µs a su eje horizontal', bg='#eff5fa').pack(
+            side=tk.LEFT, padx=3)
+        table_status = tk.StringVar(value='La calibración es solo visual: no modifica el .nxs ni los tiempos calculados de eventos.')
+
+        columns = ('shot','sync_edge_us','sync_edge_method','sync_dt_us',
+                   'Ip_start_ms','Ip_peak_ms','Halpha_start_raw_ms',
+                   'Halpha_peak_raw_ms','Halpha_minus_Ip_raw_us',
+                   'Halpha_trial_shift_us','Halpha_start_trial_ms',
+                   'Halpha_peak_trial_ms','Halpha_minus_Ip_trial_us',
+                   'same_owon_timebase')
+        headings = ('Descarga','Borde sync [µs]','Método borde','dt sync [µs]',
+                    'Inicio Ip [ms]','Pico Ip [ms]','Inicio Hα original [ms]',
+                    'Pico Hα original [ms]','Hα−Ip orig. [µs]',
+                    'Resta Hα [µs]','Inicio Hα prueba [ms]',
+                    'Pico Hα prueba [ms]','Hα−Ip prueba [µs]',
+                    'Sync/Hα mismo Owon')
+        table_frame = tk.Frame(window)
+        table_frame.pack(fill=tk.X, padx=6, pady=3)
+        rows_frame = tk.Frame(table_frame)
+        rows_frame.pack(side=tk.TOP, fill=tk.X, expand=True)
+        tree = ttk.Treeview(rows_frame, columns=columns, show='headings',
+                            selectmode='extended', height=6)
+        for col, heading in zip(columns, headings):
+            tree.heading(col, text=heading)
+            tree.column(col, width=(165 if col == 'sync_edge_method' else 125),
+                        anchor='center', stretch=False)
+        ybar = ttk.Scrollbar(rows_frame, orient=tk.VERTICAL, command=tree.yview)
+        ybar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tree.configure(yscrollcommand=ybar.set)
+        xbar = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=tree.xview)
+        xbar.pack(fill=tk.X)
+        tree.configure(xscrollcommand=xbar.set)
+        tk.Label(window, textvariable=table_status, anchor='w', justify='left',
+                 wraplength=1280).pack(fill=tk.X, padx=8, pady=(0, 5))
+
+        def _data():
+            return self.processed_data[selected_shot.current()]
+
+        def _num(value, decimals=3):
+            try:
+                number = float(value)
+                return f'{number:.{decimals}f}' if np.isfinite(number) else '—'
+            except (TypeError, ValueError):
+                return '—'
+
+        def _refresh_table(select_key=None):
+            selected_keys = {tree.item(iid, 'tags')[0]
+                             for iid in tree.selection() if tree.item(iid, 'tags')}
+            tree.delete(*tree.get_children())
+            for index, item in enumerate(self.processed_data):
+                rec = self._sync_table_record(item)
+                values = [rec['shot'], _num(rec['sync_edge_us'], 1),
+                          rec['sync_edge_method'], _num(rec['sync_dt_us'], 2),
+                          _num(rec['Ip_start_ms']), _num(rec['Ip_peak_ms']),
+                          _num(rec['Halpha_start_raw_ms']),
+                          _num(rec['Halpha_peak_raw_ms']),
+                          _num(rec['Halpha_minus_Ip_raw_us'], 1),
+                          _num(rec['Halpha_trial_shift_us'], 1),
+                          _num(rec['Halpha_start_trial_ms']),
+                          _num(rec['Halpha_peak_trial_ms']),
+                          _num(rec['Halpha_minus_Ip_trial_us'], 1),
+                          ('Sí' if rec['same_owon_timebase'] else 'No')]
+                row_key = self.shot_key(item)
+                tree.insert('', tk.END, iid=str(index), values=values, tags=(row_key,))
+                if row_key in selected_keys or row_key == select_key:
+                    tree.selection_add(str(index))
+
+        def _draw():
+            data = _data()
+            pulse = self._get_sync_pulse_for_data(data)
+            ax_pulse.clear()
+            ax_diag.clear()
+            ax_optical.clear()
+            ax_vl.clear()
+            if 'error' not in pulse:
+                t, y = pulse['time_ms'], pulse['voltage_v']
+                ax_pulse.plot(t, y, color='#3155a0', linewidth=1.2,
+                              label=pulse['data_pv'])
+                try:
+                    edge = self._sync_edge_for_data(data,
+                        fraction=float(threshold_var.get().replace(',', '.')) / 100.0)
+                    if edge['mode'] == 'manual':
+                        caption = 'elección manual'
+                    else:
+                        caption = f"{100*edge['fraction']:g}% de la excursión / 3 muestras"
+                        threshold_var.set(f"{100*edge['fraction']:g}")
+                        ax_pulse.axhline(edge['threshold_v'], color='#c56c18',
+                                        ls=':', alpha=.75)
+                    ax_pulse.axvline(edge['time_ms'], color='#d2184e', linewidth=2,
+                                    label=f"Inicio elegido: {edge['time_ms']*1000:.0f} µs")
+                    label_var.set(
+                        f"Descarga {data['shot_number']} | {pulse['data_pv']} / {pulse['time_pv']} | "
+                        f"inicio elegido: muestra {edge['index']}, "
+                        f"{edge['time_ms']*1000:.1f} µs ({caption}); "
+                        f"dt = {pulse['sample_step_us']:.2f} µs. "
+                        f"Hα usa {pulse['halpha_time_pv'] or 'un eje no identificado'}. "
+                        f"Coinciden: {'sí' if pulse['same_owon_timebase'] else 'no'}.")
+                except ValueError as exc:
+                    label_var.set(str(exc))
+                ax_pulse.axvline(.350, color='#888888', ls='--', linewidth=1.1,
+                                label='≈350 µs informado por el equipo')
+                ax_pulse.set_xlim(float(t[0]), min(float(t[-1]), 2.3))
+                ax_pulse.legend(fontsize=8, loc='best')
+            else:
+                label_var.set(f"Descarga {data['shot_number']}: {pulse['error']}")
+                ax_pulse.text(.5, .5, 'Pulso no disponible', ha='center', va='center',
+                              transform=ax_pulse.transAxes)
+            ax_pulse.set_title('Pulso real de service/sync (eje de Owon)', fontsize=11)
+            ax_pulse.set_ylabel('Voltaje [V]')
+            ax_pulse.set_xlabel('Tiempo guardado [ms]')
+            ax_pulse.grid(alpha=.25)
+
+            t_ms = np.asarray(data.get('Time', []), dtype=float) * 1000.0
+            ip = np.asarray(data.get('Ip', []), dtype=float) / 1000.0
+            h = np.asarray(data.get('Photod', []), dtype=float)
+            loop = np.asarray(data.get('Vloop_2_7_V', []), dtype=float)
+            try:
+                trial_us = float(shift_var.get().replace(',', '.'))
+                if not np.isfinite(trial_us):
+                    raise ValueError
+            except ValueError:
+                trial_us = 0.0
+            applied_us = self.halpha_display_shift_ms.get(self.shot_key(data), 0.0) * 1000
+            if t_ms.size == ip.size and ip.size:
+                ax_diag.plot(t_ms, ip, color='#004d70', label='Ip Rogowski [kA]')
+            if t_ms.size == h.size and h.size:
+                ax_optical.plot(t_ms, h, color='#aaaaaa', alpha=.75, ls='--',
+                                label='Hα original')
+                if trial_us != 0:
+                    ax_optical.plot(t_ms - trial_us/1000.0, h, color='#d2184e',
+                                    linewidth=1.5, label=f'Hα prueba −{trial_us:g} µs')
+            try:
+                rec = self._sync_table_record(data)
+                if np.isfinite(rec['Halpha_start_raw_ms']):
+                    ax_diag.axvline(rec['Halpha_start_raw_ms'], color='#aaaaaa', ls=':')
+                    ax_diag.axvline(rec['Halpha_start_raw_ms'] - trial_us/1000.0,
+                                    color='#d2184e', ls=':')
+                ip_start_ms = rec['Ip_start_ms']
+                if np.isfinite(ip_start_ms):
+                    ax_diag.axvline(ip_start_ms, color='#004d70', alpha=.65, ls=':')
+                    end_ms = float(data.get('Ip_end_time', np.nan))*1000
+                    ax_diag.set_xlim(max(0, ip_start_ms-1.0),
+                                     min(float(t_ms[-1]), max(end_ms+1.0, ip_start_ms+2.5)))
+            except (ValueError, KeyError):
+                pass
+            ax_diag.set_title(f'Ip vs Hα: vista previa (aplicados ahora: {applied_us:g} µs)',
+                              fontsize=11)
+            ax_diag.set_ylabel('Ip [kA]', color='#004d70')
+            ax_optical.set_ylabel('Hα [u.a.]', color='#d2184e')
+            artists = ax_diag.get_lines()[:1] + ax_optical.get_lines()[:2]
+            if artists:
+                ax_diag.legend(artists, [a.get_label() for a in artists],
+                               fontsize=8, loc='upper right')
+            ax_diag.grid(alpha=.25)
+            if t_ms.size == loop.size and loop.size:
+                ax_vl.plot(t_ms, loop, color='#d38a00', linewidth=1.2)
+            ax_vl.set_ylabel('VL2/VL7 [V]')
+            ax_vl.set_xlabel('Tiempo guardado [ms]')
+            ax_vl.grid(alpha=.25)
+            canvas.draw_idle()
+
+        def _select(event=None):
+            data = _data()
+            saved = self.sync_onset_choices.get(self.shot_key(data), {})
+            if saved.get('mode') == 'automatico':
+                threshold_var.set(f"{100*saved.get('fraction', .05):g}")
+            shift_var.set(f"{self.halpha_display_shift_ms.get(self.shot_key(data), .350)*1000:g}")
+            if tree.selection():
+                tree.selection_remove(*tree.selection())
+            _refresh_table(select_key=self.shot_key(data))
+            _draw()
+
+        def _auto(event=None):
+            try:
+                fraction = float(threshold_var.get().replace(',', '.')) / 100.0
+                if not 0 < fraction < 1:
+                    raise ValueError
+            except ValueError:
+                table_status.set('El umbral debe estar entre 0 y 100 %.')
+                return
+            self.sync_onset_choices[self.shot_key(_data())] = {
+                'mode': 'automatico', 'fraction': fraction}
+            _refresh_table()
+            _draw()
+
+        def _manual_click(event):
+            if event.inaxes != ax_pulse or event.xdata is None or toolbar.mode:
+                return
+            pulse = self._get_sync_pulse_for_data(_data())
+            if 'error' in pulse:
+                return
+            idx = int(np.argmin(np.abs(pulse['time_ms']-float(event.xdata))))
+            self.sync_onset_choices[self.shot_key(_data())] = {
+                'mode': 'manual', 'index': idx}
+            _refresh_table()
+            _draw()
+
+        def _use_edge():
+            try:
+                edge = self._sync_edge_for_data(_data())
+                pulse = self._get_sync_pulse_for_data(_data())
+                if not pulse.get('same_owon_timebase', False):
+                    raise ValueError('El pulso y Hα no usan el mismo eje Owon en esta descarga.')
+                shift_var.set(f"{edge['time_ms']*1000:.3f}")
+                _draw()
+            except ValueError as exc:
+                table_status.set(str(exc))
+
+        def _apply():
+            try:
+                value_us = float(shift_var.get().replace(',', '.'))
+                if not np.isfinite(value_us) or abs(value_us) > 3000:
+                    raise ValueError
+            except ValueError:
+                table_status.set('Introduzca un desplazamiento finito entre −3000 y 3000 µs.')
+                return
+            indices = [int(iid) for iid in tree.selection()] or [selected_shot.current()]
+            changed, skipped = 0, []
+            for index in indices:
+                data = self.processed_data[index]
+                pulse = self._get_sync_pulse_for_data(data)
+                if not pulse.get('same_owon_timebase', False):
+                    skipped.append(str(data.get('shot_number')))
+                    continue
+                self.halpha_display_shift_ms[self.shot_key(data)] = value_us/1000.0
+                changed += 1
+            table_status.set(f'Calibración visual de {changed} descarga(s): Hα t → t−{value_us:g} µs.'
+                             + (f' Sin mismo eje Owon: {", ".join(skipped)}.' if skipped else '')
+                             + ' Los detectores y datos originales no se modifican.')
+            _refresh_table()
+            _draw()
+            if changed:
+                self._plot_data_preserving_view()
+
+        def _apply_individual_edges():
+            changed, skipped = 0, []
+            for item in self.processed_data:
+                pulse = self._get_sync_pulse_for_data(item)
+                if not pulse.get('same_owon_timebase', False):
+                    skipped.append(str(item.get('shot_number')))
+                    continue
+                try:
+                    edge = self._sync_edge_for_data(item)
+                    self.halpha_display_shift_ms[self.shot_key(item)] = edge['time_ms']
+                    changed += 1
+                except ValueError:
+                    skipped.append(str(item.get('shot_number')))
+            table_status.set(
+                f'Vista de prueba para {changed} descarga(s): a cada Hα se restó su borde Owon.'
+                + (f' Sin borde compatible: {", ".join(skipped)}.' if skipped else '')
+                + ' Esto NO mide un desfase exacto entre ADCs.'
+            )
+            shift_var.set(f"{self.halpha_display_shift_ms.get(self.shot_key(_data()), 0)*1000:g}")
+            _refresh_table()
+            _draw()
+            if changed:
+                self._plot_data_preserving_view()
+
+        def _remove():
+            indices = [int(iid) for iid in tree.selection()] or [selected_shot.current()]
+            for index in indices:
+                self.halpha_display_shift_ms.pop(self.shot_key(self.processed_data[index]), None)
+            table_status.set('Corrección visual quitada de las descargas seleccionadas.')
+            _refresh_table()
+            _draw()
+            self._plot_data_preserving_view()
+
+        def _export():
+            filename = filedialog.asksaveasfilename(parent=window,
+                title='Exportar tabla de sincronización', defaultextension='.csv',
+                filetypes=[('CSV UTF-8', '*.csv')])
+            if filename:
+                records = [self._sync_table_record(item) for item in self.processed_data]
+                pd.DataFrame(records).to_csv(filename, index=False, encoding='utf-8-sig')
+                table_status.set(f'Tabla exportada: {filename}')
+
+        tk.Button(trial_frame, text='Usar borde elegido', command=_use_edge).pack(
+            side=tk.LEFT, padx=5)
+        tk.Button(trial_frame, text='Vista previa', command=_draw).pack(side=tk.LEFT)
+        tk.Button(trial_actions, text='Calibrar Hα en seleccionadas',
+                  command=_apply, bg='#d8f3dc').pack(side=tk.LEFT, padx=4)
+        tk.Button(trial_actions, text='Todas: borde propio',
+                  command=_apply_individual_edges).pack(side=tk.LEFT, padx=3)
+        tk.Button(trial_actions, text='Quitar calibración', command=_remove).pack(side=tk.LEFT)
+        tk.Button(trial_actions, text='Exportar tabla CSV', command=_export).pack(
+            side=tk.RIGHT, padx=4)
+        tk.Button(controls, text='Borde automático', command=_auto).pack(
+            side=tk.LEFT, padx=5)
+        selected_shot.bind('<<ComboboxSelected>>', _select)
+        threshold_combo.bind('<<ComboboxSelected>>', _auto)
+        canvas.mpl_connect('button_press_event', _manual_click)
+        _refresh_table(select_key=self.shot_key(_data()))
+        _draw()
 
     def on_ip_window_markers_changed(self):
         """Toggle vertical start/end markers for the selected plasma window."""
@@ -7525,7 +8422,7 @@ class ShotComparisonTab:
             self.show_ip_start_end_markers = bool(self.show_ip_window_var.get())
         except Exception:
             self.show_ip_start_end_markers = True
-        self.plot_data()
+        self._plot_data_preserving_view()
 
     def on_halpha_window_markers_changed(self):
         """Toggle vertical markers for the independently detected H-alpha window."""
@@ -7533,7 +8430,30 @@ class ShotComparisonTab:
             self.show_halpha_start_end_markers = bool(self.show_halpha_window_var.get())
         except Exception:
             self.show_halpha_start_end_markers = False
+        self._plot_data_preserving_view()
+
+    def _plot_data_preserving_view(self):
+        """Redraw toggled artists without losing the user's pan/zoom on any axis."""
+        axes = ('ax_ip', 'ax_loop', 'ax_bt', 'ax_halpha', 'ax_coils',
+                'ax_avantes', 'ax_ip_residual', 'ax_loop_residual',
+                'ax_bt_residual', 'ax_halpha_residual',
+                'ax_avantes_residual')
+        limits = {}
+        for name in axes:
+            ax = getattr(self, name, None)
+            if ax is not None:
+                limits[name] = (ax.get_xlim(), ax.get_ylim())
         self.plot_data()
+        self._syncing_xlim = True
+        try:
+            for name, (xlim, ylim) in limits.items():
+                ax = getattr(self, name, None)
+                if ax is not None:
+                    ax.set_xlim(xlim)
+                    ax.set_ylim(ylim)
+        finally:
+            self._syncing_xlim = False
+        self.canvas.draw_idle()
 
     def rebuild_plot_axes(self):
         """
@@ -13326,6 +14246,13 @@ class ShotComparisonTab:
         if df.empty:
             return
 
+        if self.isolated_shot_keys is not None and 'shot_order' in df.columns:
+            visible_orders = {i for i, d in enumerate(self.processed_data)
+                              if self.shot_key(d) in self.isolated_shot_keys}
+            df = df[df['shot_order'].isin(visible_orders)]
+            if df.empty:
+                return
+
         ymax = self.ax_avantes.get_ylim()[1] if self.ax_avantes.has_data() else 1.0
         shown_labels = set()
         max_labels = 45
@@ -13408,7 +14335,10 @@ class ShotComparisonTab:
             self.plot_data()
 
             # Only update the button label after the redraw has succeeded.
-            self.normalization_label.config(text=get_normalization_label(self.normalization_mode))
+            label = get_normalization_label(self.normalization_mode)
+            if any(self.halpha_display_shift_ms.values()):
+                label += ' | Hα desplazada (prueba visual)'
+            self.normalization_label.config(text=label)
             self.update_normalization_status_text()
             self.canvas.draw_idle()
 
@@ -13620,6 +14550,522 @@ class ShotComparisonTab:
         match = re.search(r'\d+', str(value))
         return str(int(match.group(0))) if match else str(value).strip()
 
+    def _create_video_side_panel(self):
+        """Scrollable, independently controlled video cards to the plot's right."""
+        self.video_sidebar = tk.Frame(self.main_frame, bg='#f5f8fc', width=390,
+                                      highlightbackground='#b8c7d8', highlightthickness=1)
+        self.video_sidebar.pack_propagate(False)
+        header = tk.Frame(self.video_sidebar, bg='#ddeaf4')
+        header.pack(fill=tk.X)
+        tk.Label(header, text='Videos de descargas', bg='#ddeaf4',
+                 font=('Arial', 11, 'bold')).pack(side=tk.LEFT, padx=7, pady=5)
+        tk.Button(header, text='×', width=2, command=self._hide_video_sidebar).pack(
+            side=tk.RIGHT, padx=4)
+        tk.Label(self.video_sidebar, bg='#f5f8fc', justify='left', anchor='w',
+                 text='Ctrl+clic para elegir varias descargas cargadas.\n'
+                      'Cada video conserva su propio control de fotogramas.').pack(
+            fill=tk.X, padx=7, pady=(5, 2))
+
+        picker = tk.Frame(self.video_sidebar, bg='#f5f8fc')
+        picker.pack(fill=tk.X, padx=6)
+        self.video_shot_listbox = tk.Listbox(picker, height=4, selectmode=tk.EXTENDED,
+                                             exportselection=False)
+        self.video_shot_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        picker_scroll = ttk.Scrollbar(picker, orient=tk.VERTICAL,
+                                      command=self.video_shot_listbox.yview)
+        picker_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.video_shot_listbox.configure(yscrollcommand=picker_scroll.set)
+        controls = tk.Frame(self.video_sidebar, bg='#f5f8fc')
+        controls.pack(fill=tk.X, padx=5, pady=3)
+        tk.Button(controls, text='Mostrar seleccionados',
+                  command=self._add_selected_video_cards).pack(side=tk.LEFT)
+        tk.Button(controls, text='Quitar todos',
+                  command=self._clear_video_cards).pack(side=tk.LEFT, padx=3)
+
+        time_controls = tk.Frame(self.video_sidebar, bg='#f5f8fc')
+        time_controls.pack(fill=tk.X, padx=6, pady=2)
+        tk.Label(time_controls, text='t relativo [ms]:', bg='#f5f8fc').pack(side=tk.LEFT)
+        self.video_shared_time_var = tk.StringVar(value='0.0')
+        ttk.Entry(time_controls, textvariable=self.video_shared_time_var,
+                  width=7).pack(side=tk.LEFT, padx=2)
+        tk.Button(time_controls, text='Ir en todos',
+                  command=self._seek_video_cards_to_shared_time).pack(side=tk.LEFT)
+        self.video_follow_cursor_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(self.video_sidebar, text='Seguir cursor de gráficos en ms',
+                       variable=self.video_follow_cursor_var, bg='#f5f8fc').pack(
+            anchor='w', padx=6)
+        self.video_panel_status = tk.StringVar(
+            value='La correlación Hα/video asigna un tiempo a cada fotograma.')
+        tk.Label(self.video_sidebar, textvariable=self.video_panel_status,
+                 bg='#f5f8fc', fg='#425466', wraplength=360,
+                 justify='left').pack(fill=tk.X, padx=7, pady=2)
+
+        scroll_host = tk.Frame(self.video_sidebar)
+        scroll_host.pack(fill=tk.BOTH, expand=True)
+        self.video_scroll_canvas = tk.Canvas(scroll_host, bg='#f5f8fc',
+                                             highlightthickness=0)
+        bar = ttk.Scrollbar(scroll_host, orient=tk.VERTICAL,
+                            command=self.video_scroll_canvas.yview)
+        bar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.video_scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.video_scroll_canvas.configure(yscrollcommand=bar.set)
+        self.video_cards_container = tk.Frame(self.video_scroll_canvas, bg='#f5f8fc')
+        inner_window = self.video_scroll_canvas.create_window(
+            (0, 0), window=self.video_cards_container, anchor='nw'
+        )
+        self.video_cards_container.bind(
+            '<Configure>', lambda event: self.video_scroll_canvas.configure(
+                scrollregion=self.video_scroll_canvas.bbox('all'))
+        )
+        self.video_scroll_canvas.bind(
+            '<Configure>', lambda event: self.video_scroll_canvas.itemconfigure(
+                inner_window, width=event.width)
+        )
+
+    def _hide_video_sidebar(self):
+        self.main_plot_panel_vars['video'].set(False)
+        self.on_main_plot_panel_changed()
+
+    def _toggle_video_side_panel(self):
+        show = bool(self.main_plot_panel_vars.get('video').get())
+        if show and not self._video_panel_visible:
+            self.video_sidebar.pack(side=tk.RIGHT, fill=tk.Y, before=self.plot_frame)
+            self._video_panel_visible = True
+            self._refresh_video_picker()
+        elif not show and self._video_panel_visible:
+            for card in self._video_panel_cards.values():
+                self._pause_video_card(card)
+            self.video_sidebar.pack_forget()
+            self._video_panel_visible = False
+
+    def _refresh_video_picker(self):
+        if not hasattr(self, 'video_shot_listbox'):
+            return
+        selected_keys = {self.shot_key(self._video_picker_data[i])
+                         for i in self.video_shot_listbox.curselection()
+                         if i < len(getattr(self, '_video_picker_data', []))}
+        self._video_picker_data = list(self.visible_shot_data())
+        self.video_shot_listbox.delete(0, tk.END)
+        for index, data in enumerate(self._video_picker_data):
+            label = (f"{data.get('shot_number', '?')} — "
+                     f"{Path(data.get('file_path', '')).parent.name}/"
+                     f"{Path(data.get('file_path', '')).name}")
+            self.video_shot_listbox.insert(tk.END, label)
+            if self.shot_key(data) in selected_keys:
+                self.video_shot_listbox.selection_set(index)
+
+    def _add_selected_video_cards(self):
+        selected = [self._video_picker_data[i] for i in self.video_shot_listbox.curselection()
+                    if i < len(self._video_picker_data)]
+        if not selected:
+            return messagebox.showinfo('Videos', 'Seleccione una o varias descargas.',
+                                       parent=self.master_frame)
+        for data in selected:
+            self._add_video_card(data)
+
+    def _add_video_card(self, data):
+        key = self.shot_key(data)
+        if key in self._video_panel_cards:
+            return
+        shot_id = self._normalized_shot_id(data.get('shot_number', ''))
+        path, _searched = self._find_video_for_shot(shot_id)
+        if path is None:
+            path = filedialog.askopenfilename(
+                title=f'Video de la descarga {shot_id}', parent=self.master_frame,
+                filetypes=[('Videos', '*.webm *.mp4 *.avi *.mov *.mkv *.mpeg *.mpg'),
+                           ('Todos', '*.*')])
+        if not path:
+            self.video_panel_status.set(f'Sin video seleccionado para {shot_id}.')
+            return
+        capture, cv2, fallback_frames = None, None, None
+        try:
+            from PIL import Image, ImageTk
+            try:
+                import cv2
+                capture = cv2.VideoCapture(str(path))
+                if not capture.isOpened():
+                    raise RuntimeError('OpenCV no pudo abrir el video.')
+                total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+                if total <= 0:
+                    raise RuntimeError('El video no informa un número de fotogramas.')
+            except Exception:
+                if capture is not None:
+                    capture.release()
+                capture, cv2 = None, None
+                # Existing ffmpeg decoder provides a portable fallback.
+                fallback_frames = extract_video_luminosity(
+                    path, return_display_frames=True)['display_frames']
+                total = len(fallback_frames)
+                if not total:
+                    raise RuntimeError('El video no contiene fotogramas.')
+        except Exception as exc:
+            if capture is not None:
+                capture.release()
+            self.video_panel_status.set(f'{shot_id}: {exc}')
+            messagebox.showerror('Video', f'{shot_id}: {exc}', parent=self.master_frame)
+            return
+
+        panel = tk.Frame(self.video_cards_container, bg='white', relief=tk.GROOVE,
+                         borderwidth=1)
+        panel.pack(fill=tk.X, padx=5, pady=5)
+        title = tk.Frame(panel, bg='#e9eff6')
+        title.pack(fill=tk.X)
+        tk.Label(title, text=f'Descarga {shot_id} — {Path(path).name}', bg='#e9eff6',
+                 font=('Arial', 9, 'bold'), anchor='w').pack(side=tk.LEFT, padx=4)
+        tk.Button(title, text='×', width=2,
+                  command=lambda selected_key=key: self._remove_video_card(selected_key)).pack(
+            side=tk.RIGHT)
+        sync_row = tk.Frame(panel, bg='white')
+        sync_row.pack(fill=tk.X, padx=4, pady=(4, 0))
+        tk.Label(sync_row, text='Sincronizar:', bg='white').pack(side=tk.LEFT)
+        sync_mode_var = tk.StringVar(value='Hα ↔ luminosidad')
+        sync_mode_combo = ttk.Combobox(
+            sync_row, textvariable=sync_mode_var, state='readonly', width=19,
+            values=('Hα ↔ luminosidad', 'Inicio Ip ↔ luminosidad'))
+        sync_mode_combo.pack(side=tk.LEFT, padx=2)
+        tk.Label(panel, text='Episodio de luminosidad (1.º, 2.º, …):',
+                 bg='white', anchor='w').pack(fill=tk.X, padx=5)
+        candidate_var = tk.StringVar(value='Analizando episodios…')
+        candidate_combo = ttk.Combobox(panel, textvariable=candidate_var,
+                                       state='readonly', width=42)
+        candidate_combo.pack(fill=tk.X, padx=5, pady=(0, 3))
+        image_label = tk.Label(panel, bg='#101820', text='Cargando video',
+                               fg='white', width=40, height=12)
+        image_label.pack(fill=tk.X, padx=3, pady=3)
+        frame_var = tk.IntVar(value=0)
+        frame_scale = tk.Scale(panel, from_=0, to=max(total - 1, 0),
+                               orient=tk.HORIZONTAL, showvalue=False,
+                               variable=frame_var, resolution=1)
+        frame_scale.pack(fill=tk.X, padx=5)
+        row = tk.Frame(panel, bg='white')
+        row.pack(fill=tk.X, padx=5)
+        play_button = tk.Button(row, text='▶')
+        play_button.pack(side=tk.LEFT)
+        tk.Label(row, text='Intervalo [µs]:', bg='white').pack(side=tk.LEFT, padx=(5, 1))
+        interval_var = tk.StringVar(value=str(VIDEO_DEFAULT_FRAME_INTERVAL_US))
+        tk.Spinbox(row, textvariable=interval_var, from_=1, to=1e6,
+                   increment=10, width=7).pack(side=tk.LEFT)
+        tk.Label(row, text='Origen (fotograma):', bg='white').pack(side=tk.LEFT, padx=(5, 1))
+        origin_var = tk.StringVar(value='')
+        tk.Spinbox(row, textvariable=origin_var, from_=0, to=total - 1,
+                   width=5).pack(side=tk.LEFT)
+        origin_var.set('')  # t=0 de la cámara nunca se presupone
+        position_var = tk.StringVar()
+        tk.Label(panel, textvariable=position_var, bg='white', anchor='w',
+                 wraplength=350).pack(fill=tk.X, padx=5, pady=2)
+        correlation_figure = Figure(figsize=(3.55, 2.25), dpi=100, facecolor='white')
+        correlation_axes = correlation_figure.add_subplot(111)
+        correlation_canvas = FigureCanvasTkAgg(correlation_figure, master=panel)
+        correlation_canvas.get_tk_widget().pack(fill=tk.X, padx=3, pady=(2, 4))
+        correlation_axes.set_title('Correlación H_Alpha luminosidad', fontsize=9)
+        correlation_axes.text(.5, .5, 'Calculando Hα y luminosidad…',
+                              ha='center', va='center', transform=correlation_axes.transAxes,
+                              fontsize=8)
+        correlation_canvas.draw_idle()
+        card = {'panel': panel, 'capture': capture, 'cv2': cv2,
+                'fallback_frames': fallback_frames,
+                'Image': Image, 'ImageTk': ImageTk, 'total': total,
+                'image_label': image_label, 'frame_var': frame_var,
+                'frame_scale': frame_scale, 'interval_var': interval_var,
+                'origin_var': origin_var, 'position_var': position_var,
+                'play_button': play_button, 'after_id': None,
+                'playing': False, 'current_index': None, 'data': data,
+                'video_path': Path(path), 'sync_mode_var': sync_mode_var,
+                'candidate_var': candidate_var, 'candidate_combo': candidate_combo,
+                'candidates': [], 'analysis': None, 'video_info': None,
+                'selected_candidate': None, 'correlation_axes': correlation_axes,
+                'correlation_canvas': correlation_canvas, 'correlation_figure': correlation_figure,
+                'correlation_cursor': None}
+        self._video_panel_cards[key] = card
+        frame_scale.configure(command=lambda raw_index, selected_key=key:
+                              self._show_video_card_frame(selected_key, int(float(raw_index))))
+        play_button.configure(command=lambda selected_key=key:
+                              self._toggle_video_card_playback(selected_key))
+        sync_mode_combo.bind('<<ComboboxSelected>>',
+                             lambda event, selected_key=key: self._synchronize_video_card(selected_key))
+        candidate_combo.bind('<<ComboboxSelected>>',
+                              lambda event, selected_key=key: self._select_video_card_candidate(selected_key))
+        interval_var.trace_add('write',
+                               lambda *_args, selected_key=key: self._invalidate_video_card_sync(selected_key))
+        tk.Button(sync_row, text='Actualizar',
+                  command=lambda selected_key=key: self._synchronize_video_card(selected_key)).pack(
+            side=tk.LEFT, padx=2)
+        self._show_video_card_frame(key, 0)
+        panel.after_idle(lambda selected_key=key: self._synchronize_video_card(selected_key))
+
+    def _invalidate_video_card_sync(self, key):
+        card = self._video_panel_cards.get(key)
+        if card is not None:
+            card['selected_candidate'] = None
+            card['candidate_var'].set('Intervalo cambiado: pulse Actualizar')
+            card['correlation_axes'].set_title(
+                'Correlación H_Alpha luminosidad | actualizar', fontsize=8)
+            card['correlation_canvas'].draw_idle()
+
+    def _synchronize_video_card(self, key):
+        card = self._video_panel_cards.get(key)
+        if card is None:
+            return
+        try:
+            frame_interval_us = float(card['interval_var'].get().replace(',', '.'))
+            if not np.isfinite(frame_interval_us) or frame_interval_us <= 0:
+                raise ValueError('Indique un intervalo físico positivo en µs.')
+            card['panel'].configure(cursor='watch')
+            card['panel'].update_idletasks()
+            if card['video_info'] is None:
+                card['video_info'] = extract_video_luminosity(
+                    card['video_path'], return_display_frames=False)
+            data = card['data']
+            analysis = analyze_halpha_video_alignment(
+                data, card['video_info'], frame_interval_us,
+                halpha_display_shift_ms=self.halpha_display_shift_ms.get(key, 0.0),
+                sync_with_halpha=card['sync_mode_var'].get().startswith('Hα'))
+            card['analysis'] = analysis
+            card['alignment_shift_reference_ms'] = self.halpha_display_shift_ms.get(key, 0.0)
+            card['candidates'] = analysis['candidates']
+            labels = []
+            for candidate in card['candidates']:
+                r = float(candidate.get('correlation', np.nan))
+                r_text = f'r={r:.2f}' if np.isfinite(r) else 'r=N/D'
+                labels.append(
+                    f"{candidate['episode_number']}.º episodio, "
+                    f"fotogramas {candidate['start_idx']}–{candidate['end_idx']} "
+                    f"({r_text}; rango {candidate['rank']})")
+            card['candidate_combo'].configure(values=labels)
+            card['candidate_combo'].current(0)
+            self._select_video_card_candidate(key)
+        except Exception as exc:
+            card['analysis'] = None
+            card['candidates'] = []
+            card['selected_candidate'] = None
+            card['candidate_var'].set('Sin candidatos')
+            ax = card['correlation_axes']
+            ax.clear()
+            ax.set_title('Correlación H_Alpha luminosidad', fontsize=9)
+            ax.text(.5, .5, str(exc), ha='center', va='center', wrap=True,
+                    transform=ax.transAxes, fontsize=8)
+            card['correlation_canvas'].draw_idle()
+            self.video_panel_status.set(f"{data.get('shot_number', key)}: {exc}" if 'data' in locals()
+                                        else str(exc))
+        finally:
+            try:
+                card['panel'].configure(cursor='')
+            except tk.TclError:
+                pass
+
+    def _select_video_card_candidate(self, key):
+        card = self._video_panel_cards.get(key)
+        if not card or not card['candidates'] or card['analysis'] is None:
+            return
+        index = card['candidate_combo'].current()
+        if index < 0:
+            return
+        candidate = card['candidates'][index]
+        card['selected_candidate'] = candidate
+        time_ms = np.asarray(candidate['video_time_ms'], dtype=float)
+        start_idx = int(candidate['start_idx'])
+        corrected = card['analysis']['light_info']['corrected_luminosity']
+        signal_label = 'luminosidad total'
+        if (candidate['alignment_signal_label'].startswith('red-channel')
+                and card['analysis']['red_light_info'] is not None):
+            corrected = card['analysis']['red_light_info']['corrected_luminosity']
+            signal_label = 'canal rojo'
+        def _normalize(values):
+            positive = np.clip(np.asarray(values, dtype=float), 0.0, None)
+            scale = float(np.nanpercentile(positive, 99)) if positive.size else 0.0
+            return positive/scale if np.isfinite(scale) and scale > 0 else positive
+        ax = card['correlation_axes']
+        ax.clear()
+        ax.plot(card['analysis']['halpha_grid_ms'],
+                _normalize(card['analysis']['halpha_corrected']),
+                color='#7a5195', label='Hα', linewidth=1.2)
+        ax.plot(time_ms, _normalize(corrected), color='#118ab2',
+                label=signal_label, linewidth=1.1)
+        ax.axvline(time_ms[start_idx], color='#36834b', ls=':', lw=.9)
+        index_frame = min(card['current_index'] or 0, len(time_ms)-1)
+        card['correlation_cursor'] = ax.axvline(
+            time_ms[index_frame], color='#de6e00', ls='--', lw=.8)
+        r = float(candidate.get('correlation', np.nan))
+        label = f'r={r:.3f}' if np.isfinite(r) else 'r no disponible'
+        sample_count = int(candidate['end_idx'])-start_idx+1
+        ax.set_title(f'Correlación H_Alpha luminosidad | {label}; '
+                     f'{sample_count} cuadros', fontsize=8)
+        ax.set_xlabel('Tiempo desde inicio Ip [ms]', fontsize=7)
+        ax.set_ylabel('Intensidad norm.', fontsize=7)
+        ax.tick_params(labelsize=7)
+        ax.grid(alpha=.25)
+        ax.legend(loc='upper right', fontsize=6)
+        ax.set_xlim(min(card['analysis']['halpha_start_ms'],
+                        float(time_ms[int(candidate['start_idx'])]), 0.0) - .4,
+                    max(card['analysis']['halpha_end_ms'],
+                        float(time_ms[int(candidate['end_idx'])]), 1.0) + .4)
+        card['correlation_figure'].tight_layout(pad=.5)
+        card['correlation_canvas'].draw_idle()
+        self._show_video_card_frame(key, card['current_index'] or 0)
+        self.video_panel_status.set(
+            f"Descarga {card['data'].get('shot_number', '?')}: "
+            f"{card['candidate_var'].get()}. "
+            + ('Correlación de muy pocos cuadros: interprétela con cautela. '
+               if sample_count < 5 else '')
+            + 'Selección individual y reversible.')
+
+    def _show_video_card_frame(self, key, index):
+        card = self._video_panel_cards.get(key)
+        if card is None:
+            return
+        index = max(0, min(int(index), card['total'] - 1))
+        if index != card['current_index']:
+            if card['fallback_frames'] is not None:
+                frame = np.asarray(card['fallback_frames'][index])
+            else:
+                cv2, capture = card['cv2'], card['capture']
+                capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+                ok, frame = capture.read()
+                if not ok:
+                    card['position_var'].set(f'No se pudo leer el fotograma {index}.')
+                    return
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            height, width = frame.shape[:2]
+            factor = min(350 / max(width, 1), 230 / max(height, 1), 1.0)
+            target = (max(1, int(width * factor)), max(1, int(height * factor)))
+            image = card['Image'].fromarray(frame).resize(target)
+            tk_image = card['ImageTk'].PhotoImage(image, master=card['image_label'])
+            card['image_label'].configure(image=tk_image, text='', height=0, width=0)
+            card['image_label'].image = tk_image
+            card['current_index'] = index
+        if card['frame_var'].get() != index:
+            card['frame_var'].set(index)
+        candidate = card.get('selected_candidate')
+        if candidate is not None:
+            aligned_time = np.asarray(candidate['video_time_ms'], dtype=float)
+            if index < aligned_time.size:
+                card['position_var'].set(
+                    f'Fotograma {index}/{card["total"] - 1} | '
+                    f't relativo a Ip: {aligned_time[index]:+.3f} ms')
+                cursor = card.get('correlation_cursor')
+                if cursor is not None:
+                    cursor.set_xdata([aligned_time[index], aligned_time[index]])
+                    card['correlation_canvas'].draw_idle()
+                return
+        try:
+            dt_us = float(card['interval_var'].get())
+            origin = int(card['origin_var'].get())
+            if not 0 <= origin < card['total']:
+                raise ValueError
+            label = f't relativo al fotograma {origin}: {(index-origin)*dt_us/1000:+.3f} ms'
+        except (ValueError, OverflowError):
+            label = 'Sin origen: indique el fotograma que desea usar como t=0'
+        card['position_var'].set(f'Fotograma {index}/{card["total"] - 1} | {label}')
+
+    def _pause_video_card(self, card):
+        card['playing'] = False
+        if card.get('after_id') is not None:
+            try:
+                card['panel'].after_cancel(card['after_id'])
+            except tk.TclError:
+                pass
+            card['after_id'] = None
+        card['play_button'].configure(text='▶')
+
+    def _toggle_video_card_playback(self, key):
+        card = self._video_panel_cards.get(key)
+        if card is None:
+            return
+        if card['playing']:
+            self._pause_video_card(card)
+            return
+        card['playing'] = True
+        card['play_button'].configure(text='⏸')
+
+        def _advance():
+            if not card['playing'] or key not in self._video_panel_cards:
+                return
+            index = card['frame_var'].get() + 1
+            if index >= card['total']:
+                self._pause_video_card(card)
+                return
+            self._show_video_card_frame(key, index)
+            card['after_id'] = card['panel'].after(100, _advance)
+
+        card['after_id'] = card['panel'].after(100, _advance)
+
+    def _remove_video_card(self, key):
+        card = self._video_panel_cards.pop(key, None)
+        if card is None:
+            return
+        self._pause_video_card(card)
+        if card['capture'] is not None:
+            card['capture'].release()
+        card['panel'].destroy()
+
+    def _clear_video_cards(self):
+        for key in list(self._video_panel_cards):
+            self._remove_video_card(key)
+
+    def _seek_video_cards_to_shared_time(self, relative_ms=None):
+        if relative_ms is None:
+            try:
+                relative_ms = float(self.video_shared_time_var.get().replace(',', '.'))
+            except ValueError:
+                self.video_panel_status.set('Introduzca un tiempo numérico en ms.')
+                return
+        updated, missing = 0, 0
+        for key, card in self._video_panel_cards.items():
+            candidate = card.get('selected_candidate')
+            if candidate is not None:
+                aligned = np.asarray(candidate['video_time_ms'], dtype=float)
+                if aligned.size and aligned[0] <= relative_ms <= aligned[-1]:
+                    self._show_video_card_frame(key,
+                        int(np.argmin(np.abs(aligned-relative_ms))))
+                    updated += 1
+                else:
+                    missing += 1
+                continue
+            try:
+                origin = int(card['origin_var'].get())
+                interval_us = float(card['interval_var'].get())
+                if not (0 <= origin < card['total'] and interval_us > 0):
+                    raise ValueError
+            except ValueError:
+                missing += 1
+                continue
+            index = int(round(origin + relative_ms * 1000 / interval_us))
+            self._show_video_card_frame(key, index)
+            updated += 1
+        if missing:
+            self.video_panel_status.set(
+                f'{updated} video(s) actualizados; marque un origen e intervalo en {missing}.')
+        elif updated:
+            self.video_panel_status.set(f'{updated} video(s) en t={relative_ms:+.3f} ms.')
+
+    def _on_video_panel_cursor_motion(self, event):
+        if (not self._video_panel_visible or not self.video_follow_cursor_var.get()
+                or event.xdata is None or event.inaxes not in self.time_axes
+                or self.normalization_mode != NORMALIZATION_NONE):
+            return
+        x_ms = float(event.xdata)
+        for key, card in self._video_panel_cards.items():
+            try:
+                ip_start_ms = float(card['data']['Ip_start_time']) * 1000
+                relative_ms = x_ms if self.display_time_mode != DISPLAY_RAW else x_ms - ip_start_ms
+                candidate = card.get('selected_candidate')
+                if candidate is not None:
+                    aligned = np.asarray(candidate['video_time_ms'], dtype=float)
+                    if aligned.size and aligned[0] <= relative_ms <= aligned[-1]:
+                        index = int(np.argmin(np.abs(aligned-relative_ms)))
+                        if index < card['total'] and index != card['current_index']:
+                            self._show_video_card_frame(key, index)
+                    continue
+                origin = int(card['origin_var'].get())
+                dt_us = float(card['interval_var'].get())
+                if dt_us <= 0:
+                    continue
+                index = int(round(origin + relative_ms * 1000 / dt_us))
+                if 0 <= index < card['total'] and index != card['current_index']:
+                    self._show_video_card_frame(key, index)
+            except (ValueError, KeyError, TypeError):
+                continue
+
     def _video_search_directories(self):
         """Return portable candidates for the repository's shots_s1/videos."""
         module_dir = Path(__file__).resolve().parent
@@ -13707,7 +15153,42 @@ class ShotComparisonTab:
         return (candidates[selected - 1] if selected is not None else None), searched
 
     def compare_with_video(self):
-        """Synchronize a shot with its summed fast-camera luminosity curve."""
+        """Show existing loaded shots with Hα/video correlation in the right pane."""
+        if not self.processed_data:
+            return messagebox.showinfo('Comparar con video',
+                                       'Cargue primero una o más descargas .nxs.',
+                                       parent=self.master_frame)
+        if not self._video_panel_visible:
+            self.main_plot_panel_vars['video'].set(True)
+            self._update_plots_menu_label()
+            self._toggle_video_side_panel()
+        selected = [self._video_picker_data[i]
+                    for i in self.video_shot_listbox.curselection()
+                    if i < len(self._video_picker_data)]
+        if not selected:
+            visible = list(self.visible_shot_data())
+            if len(visible) == 1:
+                selected = visible
+            else:
+                choice = simpledialog.askstring(
+                    'Comparar con video',
+                    'Número(s) de descarga separados por coma (p. ej. 2618, 2620):',
+                    parent=self.master_frame)
+                if choice is None:
+                    return
+                ids = {self._normalized_shot_id(part.strip())
+                       for part in choice.split(',') if part.strip()}
+                selected = [data for data in visible
+                            if self._normalized_shot_id(data.get('shot_number')) in ids]
+                if not selected:
+                    return messagebox.showinfo(
+                        'Comparar con video', 'No hay descargas cargadas con esos números.',
+                        parent=self.master_frame)
+        for data in selected:
+            self._add_video_card(data)
+
+    def compare_with_video_detailed(self):
+        """Legacy detailed camera comparison with extended diagnostics."""
         if not self.processed_data:
             return messagebox.showinfo(
                 "No shots loaded",
@@ -13786,129 +15267,44 @@ class ShotComparisonTab:
         if sync_with_halpha is None:
             return
 
-        Time = np.asarray(data.get('Time', np.array([])), dtype=float)
-        Ip = np.asarray(data.get('Ip', np.array([])), dtype=float)
-        Halpha = np.asarray(data.get('Photod', np.array([])), dtype=float)
-        Vloop = np.asarray(data.get('Vloop_2_7_V', np.array([])), dtype=float)
-        ip_start = float(data.get('Ip_start_time_Ip_only', data.get('Ip_start_time', np.nan)))
-        ip_only_end_absolute = float(data.get('Ip_end_time_ip_only', np.nan))
-        target_ip_duration_ms = (
-            (ip_only_end_absolute - ip_start) * 1000.0
-            if np.isfinite(ip_only_end_absolute) and np.isfinite(ip_start)
-            and ip_only_end_absolute > ip_start
-            else np.nan
-        )
-        frame_interval_ms = float(frame_interval_us) * 1e-3
-        diagnostic_time_ms = (Time - ip_start) * 1000.0
-
+        Time = np.asarray(data.get('Time', []), dtype=float)
+        Ip = np.asarray(data.get('Ip', []), dtype=float)
+        Halpha = np.asarray(data.get('Photod', []), dtype=float)
+        Vloop = np.asarray(data.get('Vloop_2_7_V', []), dtype=float)
+        ip_start = float(data.get('Ip_start_time_Ip_only',
+                                  data.get('Ip_start_time', np.nan)))
         try:
             self.main_frame.configure(cursor='watch')
             self.main_frame.update_idletasks()
             video_info = extract_video_luminosity(video_path, return_display_frames=True)
-            # Total grayscale luminosity always defines the optical episodes and
-            # their duration. The red channel is an optional, more H-alpha-like
-            # clock signal only; it must not replace broadband duration.
-            video_signal_label = 'total grayscale camera luminosity'
-            light_info = detect_video_light_window(
-                video_info['frame_sums'],
-                frame_interval_ms=frame_interval_ms,
-                target_duration_ms=target_ip_duration_ms,
-            )
-            red_frame_sums = np.asarray(
-                video_info.get('red_frame_sums', np.array([])), dtype=float
-            )
-            red_light_info = (
-                detect_video_light_window(
-                    red_frame_sums,
-                    frame_interval_ms=frame_interval_ms,
-                    target_duration_ms=target_ip_duration_ms,
-                )
-                if red_frame_sums.size else None
-            )
-            halpha_light_info = detect_halpha_with_video_method(
-                diagnostic_time_ms,
-                Halpha,
-                frame_interval_ms=frame_interval_ms,
-                target_duration_ms=target_ip_duration_ms,
-            )
+            analysis = analyze_halpha_video_alignment(
+                data, video_info, frame_interval_us,
+                halpha_display_shift_ms=self.halpha_display_shift_ms.get(
+                    self.shot_key(data), 0.0),
+                sync_with_halpha=sync_with_halpha)
         except Exception as exc:
-            return messagebox.showerror(
-                "Video processing error",
-                f"The luminosity curve could not be generated:\n{exc}",
-                parent=self.master_frame,
-            )
+            return messagebox.showerror('Video processing error',
+                                        f'Error al correlacionar Hα/video:\n{exc}',
+                                        parent=self.master_frame)
         finally:
             try:
                 self.main_frame.configure(cursor='')
             except Exception:
                 pass
-
+        target_ip_duration_ms = analysis['target_ip_duration_ms']
+        frame_interval_ms = analysis['frame_interval_ms']
+        diagnostic_time_ms = analysis['diagnostic_time_ms']
+        light_info = analysis['light_info']
+        halpha_light_info = analysis['halpha_light_info']
         frame_sums = np.asarray(video_info['frame_sums'], dtype=float)
         corrected = np.asarray(light_info['corrected_luminosity'], dtype=float)
-        frame_index = np.arange(frame_sums.size, dtype=float)
-
-        halpha_time_grid_ms = np.asarray(halpha_light_info['time_grid_ms'], dtype=float)
-        halpha_corrected = np.asarray(halpha_light_info['corrected_luminosity'], dtype=float)
-        halpha_start_idx = int(halpha_light_info['start_idx'])
-        halpha_end_idx = int(halpha_light_info['end_idx'])
-        halpha_start_relative_ms = float(halpha_time_grid_ms[halpha_start_idx])
-        halpha_end_relative_ms = float(halpha_time_grid_ms[halpha_end_idx])
-        halpha_duration_ms = max(
-            halpha_end_relative_ms - halpha_start_relative_ms, 0.0
-        )
-
-        if sync_with_halpha:
-            red_corrected = (
-                np.asarray(red_light_info['corrected_luminosity'], dtype=float)
-                if red_light_info is not None else np.array([], dtype=float)
-            )
-            synchronization_candidates = build_halpha_video_sync_candidates(
-                halpha_time_grid_ms,
-                halpha_corrected,
-                frame_interval_ms,
-                corrected,
-                light_info,
-                halpha_start_relative_ms,
-                halpha_end_relative_ms,
-                halpha_duration_ms,
-                red_corrected=red_corrected,
-                max_candidates=VIDEO_MAX_SYNC_CANDIDATES,
-            )
-            if not synchronization_candidates:
-                return messagebox.showerror(
-                    "Video processing error",
-                    "No valid camera/H-alpha synchronization candidate could be generated.",
-                    parent=self.master_frame,
-                )
-        else:
-            start_idx = int(light_info['start_idx'])
-            end_idx = int(light_info['end_idx'])
-            base_video_time_ms = (frame_index - start_idx) * frame_interval_ms
-            ip_alignment_info = {
-                'shift_ms': 0.0,
-                'correlation': np.nan,
-                'method': 'ip_only_start_alignment',
-            }
-            synchronization_candidates = [{
-                'rank': 1,
-                'episode_number': 1,
-                'start_idx': start_idx,
-                'end_idx': end_idx,
-                'duration_ms': (end_idx - start_idx) * frame_interval_ms,
-                'halpha_duration_error_ratio': np.nan,
-                'base_video_time_ms': base_video_time_ms,
-                'video_time_ms': base_video_time_ms,
-                'alignment_info': ip_alignment_info,
-                'alignment_signal_label': 'Ip-only reference (no optical correlation)',
-                'alignment_shift_ms': 0.0,
-                'correlation': np.nan,
-                'red_alignment_info': {
-                    'shift_ms': np.nan,
-                    'correlation': np.nan,
-                    'method': 'not_requested',
-                },
-                'total_alignment_info': ip_alignment_info,
-            }]
+        halpha_time_grid_ms = analysis['halpha_grid_ms']
+        halpha_corrected = analysis['halpha_corrected']
+        halpha_start_relative_ms = analysis['halpha_start_ms']
+        halpha_end_relative_ms = analysis['halpha_end_ms']
+        halpha_duration_ms = max(halpha_end_relative_ms-halpha_start_relative_ms, 0.0)
+        synchronization_candidates = analysis['candidates']
+        video_signal_label = 'total grayscale camera luminosity'
 
         selected_sync = synchronization_candidates[0]
         start_frame = int(selected_sync['start_idx'])
@@ -14749,6 +16145,13 @@ class ShotComparisonTab:
 
         # Rebuild color assignment whenever new folders/shots are loaded.
         self.folder_color_state = {}
+        if loaded_count and self._sync_window is not None:
+            try:
+                if self._sync_window.winfo_exists():
+                    self._sync_window.destroy()  # its shot selector was a snapshot
+            except tk.TclError:
+                pass
+            self._sync_window = None
         self.plot_data()
 
         if loaded_count:
@@ -14759,11 +16162,340 @@ class ShotComparisonTab:
             messagebox.showwarning("Load errors", "Some files could not be loaded:\n" + "\n".join(errors))
 
     def clear_shots(self):
+        self._clear_video_cards()
+        if self._sync_window is not None:
+            try:
+                self._sync_window.destroy()
+            except tk.TclError:
+                pass
+            self._sync_window = None
         self.file_paths = []
         self.processed_data = []
+        self.halpha_display_shift_ms.clear()
+        self.sync_onset_choices.clear()
+        self._sync_pulse_cache.clear()
+        self._sync_halpha_start_cache.clear()
         self.folder_order = []
         self.folder_color_state = {}
+        self.selected_shot_keys.clear()
+        self.highlighted_shot_keys.clear()
+        self.isolated_shot_keys = None
         self.plot_data()
+
+    @staticmethod
+    def shot_key(data):
+        """Identify one file, even when two folders contain the same shot ID."""
+        return os.path.normcase(os.path.abspath(str(data.get('file_path', ''))))
+
+    def visible_shot_data(self):
+        isolated = self.isolated_shot_keys
+        return [d for d in self.processed_data
+                if isolated is None or self.shot_key(d) in isolated]
+
+    def _shot_under_mouse(self, event):
+        for label, handle, key in getattr(self, 'legend_shot_targets', []):
+            for artist in (label, handle):
+                try:
+                    if artist.get_window_extent().contains(event.x, event.y):
+                        return key
+                except (ValueError, AttributeError):
+                    pass
+        hit = self.find_nearest_hover_line(event)
+        return getattr(hit[1], '_mephist_shot_key', None) if hit else None
+
+    @staticmethod
+    def _event_has_control(event):
+        key = str(getattr(event, 'key', '') or '').lower()
+        gui_event = getattr(event, 'guiEvent', None)
+        return ('control' in key or 'ctrl' in key or
+                bool(getattr(gui_event, 'state', 0) & 0x0004))
+
+    def on_main_plot_button_press(self, event):
+        """Ctrl+click selects several curves or legend entries; right-click opens actions."""
+        if event.button not in (1, 3) or not self.processed_data:
+            return
+        if event.button == 1 and (getattr(self.main_ruler, 'active', False)
+                                  or getattr(self.toolbar, 'mode', None)):
+            return
+        key = self._shot_under_mouse(event)
+        control = self._event_has_control(event)
+        if event.button == 1:
+            if key is None:
+                return
+            if control:
+                if key in self.selected_shot_keys:
+                    self.selected_shot_keys.remove(key)
+                else:
+                    self.selected_shot_keys.add(key)
+            else:
+                self.selected_shot_keys = {key}
+            self.plot_data()
+            return
+
+        if key is not None:
+            if control:
+                self.selected_shot_keys.add(key)
+            elif key not in self.selected_shot_keys:
+                self.selected_shot_keys = {key}
+            self.plot_data()
+        self._show_shot_context_menu(event)
+
+    def _show_shot_context_menu(self, event):
+        menu = tk.Menu(self.canvas.get_tk_widget(), tearoff=0)
+        count = len(self.selected_shot_keys)
+        selected_state = tk.NORMAL if count else tk.DISABLED
+        menu.add_command(label=f'Seleccionadas: {count}', state=tk.DISABLED)
+        menu.add_separator()
+        menu.add_command(label='Resaltar selección', state=selected_state,
+                         command=self.highlight_selected_shots)
+        menu.add_command(label='Aislar selección', state=selected_state,
+                         command=self.isolate_selected_shots)
+        menu.add_command(label='Superponer señales…', state=selected_state,
+                         command=self.show_overlay_dialog)
+        menu.add_separator()
+        menu.add_command(label='Mostrar todas las descargas', command=self.show_all_shots)
+        menu.add_command(label='Quitar resaltado', command=self.clear_shot_highlights)
+        menu.add_command(label='Deseleccionar', command=self.clear_shot_selection)
+        if self.cursor_dynamics_enabled and self.data_box_text_cache:
+            menu.add_separator()
+            menu.add_command(label='Copiar tabla del cursor',
+                             command=self.copy_cursor_table)
+        try:
+            gui = getattr(event, 'guiEvent', None)
+            widget = self.canvas.get_tk_widget()
+            x = getattr(gui, 'x_root', widget.winfo_pointerx())
+            y = getattr(gui, 'y_root', widget.winfo_pointery())
+            menu.tk_popup(int(x), int(y))
+        finally:
+            menu.grab_release()
+
+    def highlight_selected_shots(self):
+        if self.selected_shot_keys:
+            self.highlighted_shot_keys = set(self.selected_shot_keys)
+            self.plot_data()
+
+    def isolate_selected_shots(self):
+        if self.selected_shot_keys:
+            self.isolated_shot_keys = set(self.selected_shot_keys)
+            self.plot_data()
+
+    def show_all_shots(self):
+        self.isolated_shot_keys = None
+        self.plot_data()
+
+    def clear_shot_highlights(self):
+        self.highlighted_shot_keys.clear()
+        self.plot_data()
+
+    def clear_shot_selection(self):
+        self.selected_shot_keys.clear()
+        self.plot_data()
+
+    def copy_cursor_table(self):
+        text = getattr(self, 'data_box_text_cache', '')
+        if text:
+            pyperclip.copy(text)
+            messagebox.showinfo('Copiado', 'Tabla del cursor copiada al portapapeles.')
+
+    def _style_shot_line(self, line, data):
+        key = self.shot_key(data)
+        if key in self.highlighted_shot_keys:
+            palette = ('#ff0080', '#00a6ff', '#8c00ff', '#ff6b00', '#008c50')
+            order = [self.shot_key(d) for d in self.processed_data
+                     if self.shot_key(d) in self.highlighted_shot_keys]
+            line.set_color(palette[order.index(key) % len(palette)])
+            line.set_linewidth(3.2)
+            line.set_alpha(1.0)
+            line.set_zorder(20)
+        elif self.highlighted_shot_keys:
+            line.set_alpha(0.18)
+            line.set_linewidth(1.05)
+            line.set_zorder(2)
+        elif key in self.selected_shot_keys:
+            line.set_linewidth(2.4)
+            line.set_alpha(1.0)
+            line.set_zorder(10)
+
+    def _overlay_signal_arrays(self, data, signal):
+        """Keep the full physical time trace, including H-alpha after Ip end.
+
+        Tau normalization in the main view truncates data to the Ip window;
+        that window would hide precisely the tails compared in this overlay.
+        """
+        time_s = np.asarray(data.get('Time', np.array([])), dtype=float)
+        if time_s.size == 0:
+            return np.array([]), np.array([]), ''
+        if self.display_time_mode == DISPLAY_RAW:
+            x = time_s * 1000.0
+        else:
+            x = (time_s - float(data.get('Ip_start_time', 0.0))) * 1000.0
+        if signal == 'Ip':
+            return x, np.asarray(data.get('Ip', []), dtype=float) / 1000.0, 'kA'
+        if signal == 'Hα':
+            return x, np.asarray(data.get('Photod', []), dtype=float), 'u.a.'
+        if signal == 'Vloop (VL2+VL7)/2':
+            return x, np.asarray(data.get('Vloop_2_7_V', []), dtype=float), 'V'
+        if signal in ('VL2', 'VL3', 'VL7'):
+            return x, np.asarray(data.get(f'{signal}_V', []), dtype=float), 'V'
+        if signal == 'Bt':
+            return x, np.asarray(data.get('B_phi', []), dtype=float), 'mT'
+        return np.array([]), np.array([]), ''
+
+    def show_overlay_dialog(self):
+        """Choose two signals for one or several Ctrl-selected discharges."""
+        selected = [d for d in self.processed_data
+                    if self.shot_key(d) in self.selected_shot_keys]
+        if not selected:
+            messagebox.showinfo('Superponer', 'Selecciona una o varias descargas primero.')
+            return
+
+        dialog = tk.Toplevel(self.app)
+        dialog.title('Superponer señales de descargas seleccionadas')
+        dialog.resizable(False, False)
+        body = tk.Frame(dialog, padx=14, pady=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        description = ', '.join(self.get_plot_label_for_data(d) for d in selected)
+        tk.Label(body, text=f'Descargas: {description}', wraplength=520,
+                 justify=tk.LEFT).grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 12))
+        tk.Label(body, text='Tiempo físico en ms: conserva la señal después del fin de Ip.',
+                 justify=tk.LEFT).grid(row=1, column=0, columnspan=2,
+                                        sticky='w', pady=(0, 10))
+        options = ('Ip', 'Hα', 'Vloop (VL2+VL7)/2', 'VL2', 'VL3', 'VL7', 'Bt')
+        first, second = tk.StringVar(value='Ip'), tk.StringVar(value='Hα')
+        tk.Label(body, text='Eje izquierdo:').grid(row=2, column=0, sticky='w', pady=4)
+        ttk.Combobox(body, textvariable=first, state='readonly', width=27,
+                     values=options).grid(row=2, column=1, sticky='w', pady=4)
+        tk.Label(body, text='Eje derecho:').grid(row=3, column=0, sticky='w', pady=4)
+        ttk.Combobox(body, textvariable=second, state='readonly', width=27,
+                     values=options).grid(row=3, column=1, sticky='w', pady=4)
+
+        def open_overlay():
+            if first.get() == second.get():
+                messagebox.showwarning('Superponer', 'Selecciona dos señales distintas.', parent=dialog)
+                return
+            if not self.plot_selected_overlay(selected, first.get(), second.get()):
+                return
+            dialog.destroy()
+
+        tk.Button(body, text='Graficar', command=open_overlay).grid(
+            row=4, column=0, columnspan=2, pady=(12, 0)
+        )
+        dialog.transient(self.app)
+
+    def plot_selected_overlay(self, selected, first_signal, second_signal):
+        """Draw two measured quantities on separate y axes in one zoomable graph."""
+        curves = []
+        base_labels = [self.get_plot_label_for_data(data) for data in selected]
+        labels_by_key = {
+            self.shot_key(data): (
+                label if base_labels.count(label) == 1 else f'{label} [{index + 1}]'
+            )
+            for index, (data, label) in enumerate(zip(selected, base_labels))
+        }
+        self.folder_color_state = {}
+        color_by_key = {}
+        for i, data in enumerate(self.processed_data):
+            color_by_key[self.shot_key(data)] = self.get_color_for_data(data, i)
+        for data in selected:
+            key = self.shot_key(data)
+            for signal in (first_signal, second_signal):
+                x, y, unit = self._overlay_signal_arrays(data, signal)
+                if x.size != y.size or x.size < 2 or not np.any(np.isfinite(y)):
+                    continue
+                if signal.startswith('Vloop') and not np.nanmax(np.abs(y)) > 0:
+                    continue
+                curves.append((data, signal, x, y, unit, color_by_key[key]))
+
+        if not curves or any(not any(c[1] == signal for c in curves)
+                             for signal in (first_signal, second_signal)):
+            messagebox.showwarning('Superponer', 'Faltan datos válidos para alguna de las señales.')
+            return False
+
+        window = tk.Toplevel(self.app)
+        window.title(f'Superposición: {first_signal} y {second_signal}')
+        window.geometry('1140x680')
+        figure = Figure(figsize=(11, 6), facecolor='white')
+        left = figure.add_subplot(111)
+        right = left.twinx()
+        right.patch.set_visible(False)
+        plot_lines = []
+        line_series = []
+        legend_handles, legend_labels = [], []
+        overlay_x_unit = 'ms'
+        for data, signal, x, y, unit, color in curves:
+            axis = left if signal == first_signal else right
+            label = f'{labels_by_key[self.shot_key(data)]} · {signal}'
+            line, = axis.plot(x, y, color=color,
+                              linestyle='-' if axis is left else '--',
+                              linewidth=1.85, alpha=.92, label=label)
+            plot_lines.append(line)
+            line_series.append((data, signal, np.asarray(x), np.asarray(y)))
+            legend_handles.append(line)
+            legend_labels.append(label)
+        unit_first = next(c[4] for c in curves if c[1] == first_signal)
+        unit_second = next(c[4] for c in curves if c[1] == second_signal)
+        left.set_ylabel(f'{first_signal} [{unit_first}]')
+        right.set_ylabel(f'{second_signal} [{unit_second}]')
+        left.set_xlabel('Tiempo [ms]' if self.display_time_mode == DISPLAY_RAW
+                        else 'Tiempo - t_Ip,inicio [ms]')
+        left.grid(True, linestyle='--', alpha=.4)
+        figure.legend(legend_handles, legend_labels, loc='upper center',
+                      bbox_to_anchor=(.5, .985), ncol=min(4, len(legend_handles)),
+                      fontsize='small')
+        figure.subplots_adjust(top=.80, bottom=.16, left=.11, right=.88)
+        canvas = FigureCanvasTkAgg(figure, master=window)
+        toolbar = NavigationToolbar2Tk(canvas, window)
+        toolbar.update()
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        ruler = PlotRuler(canvas, toolbar, snap_lines=lambda: plot_lines)
+
+        cursor_status = tk.StringVar(master=window, value='Cursor dinámico desactivado')
+        status_label = tk.Label(window, textvariable=cursor_status, anchor='w',
+                                justify='left', wraplength=1080)
+        status_label.pack(side=tk.BOTTOM, fill=tk.X, padx=8)
+        guide = left.axvline(0, ls=':', lw=1.2, color='#333333',
+                             label='_nolegend_', visible=False)
+        cursor_enabled = [False]
+
+        def update_cursor(event):
+            if not cursor_enabled[0] or event.inaxes not in (left, right) or event.xdata is None:
+                return
+            x_value = float(event.xdata)
+            guide.set_xdata([x_value, x_value])
+            guide.set_visible(True)
+            pieces = [f'{x_value:.4g} {overlay_x_unit}']
+            for data, signal, x, y in line_series:
+                valid = np.isfinite(x) & np.isfinite(y)
+                if np.count_nonzero(valid) < 2:
+                    continue
+                x_valid, y_valid = x[valid], y[valid]
+                if x_valid[0] <= x_value <= x_valid[-1]:
+                    pieces.append(
+                        f'{labels_by_key[self.shot_key(data)]} {signal}: '
+                        f'{np.interp(x_value, x_valid, y_valid):.4g}'
+                    )
+            cursor_status.set(' | '.join(pieces[:9]) + (' | …' if len(pieces) > 9 else ''))
+            canvas.draw_idle()
+
+        canvas.mpl_connect('motion_notify_event', update_cursor)
+
+        def toggle_cursor():
+            cursor_enabled[0] = not cursor_enabled[0]
+            cursor_button.config(text=('Desactivar cursor dinámico' if cursor_enabled[0]
+                                       else 'Activar cursor dinámico'))
+            if not cursor_enabled[0]:
+                guide.set_visible(False)
+                cursor_status.set('Cursor dinámico desactivado')
+                canvas.draw_idle()
+
+        cursor_button = tk.Button(toolbar, text='Activar cursor dinámico',
+                                  command=toggle_cursor)
+        cursor_button.pack(side=tk.LEFT, padx=5)
+        window._overlay_state = (figure, canvas, toolbar, ruler, plot_lines,
+                                 cursor_button, status_label, cursor_status)
+        canvas.draw()
+        return True
 
     def save_data_to_csv(self):
         if not self.processed_data:
@@ -14822,7 +16554,9 @@ class ShotComparisonTab:
             "y_unit": str(y_unit or ""),
             "x_label": str(x_label or ""),
         }
+        line._mephist_shot_key = self.shot_key(data)
         self.hover_lines.append(line)
+        self._style_shot_line(line, data)
 
     def hide_hover_annotation(self):
         """Hide the current hover annotation, if it exists."""
@@ -15030,14 +16764,10 @@ class ShotComparisonTab:
 
         if self.cursor_dynamics_enabled:
             self.motion_cid = self.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
-            self.right_click_cid = self.canvas.mpl_connect('button_press_event', self.on_right_click)
         else:
             if hasattr(self, 'motion_cid') and self.motion_cid is not None:
                 self.canvas.mpl_disconnect(self.motion_cid)
                 self.motion_cid = None
-            if hasattr(self, 'right_click_cid') and self.right_click_cid is not None:
-                self.canvas.mpl_disconnect(self.right_click_cid)
-                self.right_click_cid = None
             self.clear_cursor_lines()
             self.set_data_box_text("")
 
@@ -15072,7 +16802,7 @@ class ShotComparisonTab:
 
         rows = ["Shot\tX\tBt\tIp\tH-alpha\tS(lambda)"]
 
-        for data in self.processed_data:
+        for data in self.visible_shot_data():
             xb, yb, xi, yi, xh, yh = self.get_display_time_arrays(data)
             wl, sy = self.get_display_spectrum_arrays(data)
 
@@ -15102,10 +16832,9 @@ class ShotComparisonTab:
         self.canvas.draw_idle()
 
     def on_right_click(self, event):
-        if not event.inaxes or not self.cursor_dynamics_enabled or event.button != 3:
-            return
-        pyperclip.copy(getattr(self, "data_box_text_cache", self.data_box_label.cget("text")))
-        messagebox.showinfo("Copied", "Cursor table copied to clipboard.")
+        """Compatibility hook: the context menu owns right clicks now."""
+        if event.button == 3:
+            self.on_main_plot_button_press(event)
 
     def clear_cursor_lines(self):
         for line in self.cursor_lines:
@@ -15306,7 +17035,8 @@ class ShotComparisonTab:
         # interval so its value at plasma start/end can be compared directly
         # with Ip, loop voltage and H-alpha.  Its amplitude stays in mT.
         xb, yb = get_normalized_temporal_signal(
-            data['Time'], data['B_phi'], data['Ip'], NORMALIZATION_NONE,
+            data['Time'], data['B_phi'], data['Ip'],
+            NORMALIZATION_TAU if m != NORMALIZATION_NONE else NORMALIZATION_NONE,
             signal_kind="bt", display_mode=self.display_time_mode,
             sync_time=start_time, force_tau=(m != NORMALIZATION_NONE),
             start_time=start_time, end_time=end_time
@@ -15321,12 +17051,20 @@ class ShotComparisonTab:
             start_time=start_time, end_time=end_time
         )
 
+        shift_ms = self.halpha_display_shift_ms.get(self.shot_key(data), 0.0)
+        halpha_values = (resample_time_shifted_signal(
+            data['Time'], data['Photod'], shift_ms)
+            if m != NORMALIZATION_NONE else data['Photod'])
         xh, yh = get_normalized_temporal_signal(
-            data['Time'], data['Photod'], data['Ip'], m,
+            data['Time'], halpha_values, data['Ip'], m,
             signal_kind="halpha", display_mode=self.display_time_mode,
             sync_time=start_time, force_tau=(m != NORMALIZATION_NONE),
             start_time=start_time, end_time=end_time
         )
+        # In ms shift the x coordinates. In τ the signal was first evaluated
+        # at corrected physical times on the Ip grid, then clipped/normalized.
+        if m == NORMALIZATION_NONE:
+            xh = xh - shift_ms
 
         # In no-normalization and tau-only modes, Ip is still physically displayed in kA.
         # In tau_max and tau_area, Ip is normalized and must not be divided by 1000.
@@ -15420,7 +17158,9 @@ class ShotComparisonTab:
                         color=color,
                         linestyle=":",
                         linewidth=1.0,
-                        alpha=0.80,
+                        alpha=(0.12 if self.highlighted_shot_keys
+                               and self.shot_key(data) not in self.highlighted_shot_keys
+                               else 0.80),
                         zorder=1,
                         label="_nolegend_"
                     )
@@ -15459,6 +17199,9 @@ class ShotComparisonTab:
         def _display_x(event_time):
             if not np.isfinite(event_time):
                 return np.nan
+            # H-alpha event markers follow the same optional visual translation
+            # as its curve. Ip/VL/Bt markers remain at their original times.
+            event_time -= self.halpha_display_shift_ms.get(self.shot_key(data), 0.0) * 1e-3
             if panel_key in ("Ip", "LV", "Bt", "H_alpha") and self.normalization_mode != NORMALIZATION_NONE:
                 duration = ip_end - ip_start
                 if not np.isfinite(duration) or duration <= 0:
@@ -15505,12 +17248,24 @@ class ShotComparisonTab:
                         color=color,
                         linestyle=linestyle,
                         linewidth=1.35,
-                        alpha=0.90,
+                        alpha=(0.12 if self.highlighted_shot_keys
+                               and self.shot_key(data) not in self.highlighted_shot_keys
+                               else 0.90),
                         zorder=2,
                         label="_nolegend_"
                     )
 
     def plot_data(self):
+        if getattr(self, '_video_panel_visible', False):
+            self._refresh_video_picker()
+            for card_key, video_card in list(self._video_panel_cards.items()):
+                if (video_card.get('analysis') is not None and
+                        video_card.get('alignment_shift_reference_ms', 0.0)
+                        != self.halpha_display_shift_ms.get(card_key, 0.0)):
+                    self._synchronize_video_card(card_key)
+        if self.main_ruler is not None:
+            self.main_ruler.reset_for_redraw()
+        self.cursor_lines = []
         self.rebuild_plot_axes()
 
         for ax in self.time_axes + self.time_residual_axes + self.spec_axes + self.spec_residual_axes:
@@ -15519,6 +17274,7 @@ class ShotComparisonTab:
 
         self.hover_lines = []
         self.hover_annotation = None
+        self.legend_shot_targets = []
 
         # Remove the single figure-level legend from the previous redraw, if any.
         for legend in list(self.fig.legends):
@@ -15538,9 +17294,13 @@ class ShotComparisonTab:
         # after loading/clearing shots.
         self.folder_color_state = {}
         display_cache = []
+        legend_entries = []
 
         for plot_index, d in enumerate(self.processed_data):
             c = self.get_color_for_data(d, fallback_index=plot_index)
+            if (self.isolated_shot_keys is not None
+                    and self.shot_key(d) not in self.isolated_shot_keys):
+                continue
             plot_label = self.get_plot_label_for_data(d)
             xb, yb, xi, yi, xh, yh = self.get_display_time_arrays(d)
             wl, sy = self.get_display_spectrum_arrays(d)
@@ -15572,6 +17332,18 @@ class ShotComparisonTab:
                     self.register_hover_line(line_loop, d, "Vloop", "V", x_label=self.get_current_time_axis_label())
 
             if self.ax_halpha is not None:
+                trial_shift = self.halpha_display_shift_ms.get(self.shot_key(d), 0.0)
+                if self.show_halpha_raw_comparison and trial_shift:
+                    if self.normalization_mode == NORMALIZATION_NONE:
+                        x_original, y_original = xh + trial_shift, yh
+                    else:
+                        x_original, y_original = get_normalized_temporal_signal(
+                            d['Time'], d['Photod'], d['Ip'], self.normalization_mode,
+                            signal_kind='halpha', display_mode=self.display_time_mode,
+                            sync_time=d['Ip_start_time'], force_tau=True,
+                            start_time=d['Ip_start_time'], end_time=d['Ip_end_time'])
+                    self.ax_halpha.plot(x_original, y_original, color=c,
+                                        ls=':', alpha=0.30, lw=1.0, label='_nolegend_')
                 line_ha, = self.ax_halpha.plot(xh, yh, label=plot_label, color=c)
                 self.register_hover_line(line_ha, d, "H-alpha", self.get_hover_y_unit("H_alpha"), x_label=self.get_current_time_axis_label())
 
@@ -15598,8 +17370,22 @@ class ShotComparisonTab:
                 line_spec, = self.ax_avantes.plot(wl, sy, label=plot_label, color=c)
                 self.register_hover_line(line_spec, d, "Spectrum", self.get_hover_y_unit("spectrum"), x_label="Wavelength [nm]")
 
-            self.draw_plasma_window_markers_for_data(d, c)
-            self.draw_halpha_window_markers_for_data(d, c)
+            drawn_line = next((line for line in self.hover_lines
+                               if line._mephist_shot_key == self.shot_key(d)), None)
+            marker_color = drawn_line.get_color() if drawn_line is not None else c
+            legend_entries.append((self.shot_key(d), plot_label, marker_color))
+            self.draw_plasma_window_markers_for_data(d, marker_color)
+            self.draw_halpha_window_markers_for_data(d, marker_color)
+
+        if (self.show_halpha_raw_comparison and self.ax_halpha is not None
+                and any(self.halpha_display_shift_ms.get(self.shot_key(d), 0.0)
+                        for d in self.visible_shot_data())):
+            self.ax_halpha.text(
+                .01, .98, 'Hα: sólida = prueba; punteada tenue = original',
+                transform=self.ax_halpha.transAxes, ha='left', va='top',
+                fontsize=8, color='#5c4363',
+                bbox=dict(facecolor='white', alpha=.8, edgecolor='none')
+            )
 
         # Overlay selected local NIST lines only after experimental spectra exist.
         if self.ax_avantes is not None:
@@ -15654,15 +17440,23 @@ class ShotComparisonTab:
 
         # Only one legend is shown for the full comparison figure.
         # It is placed in the upper white band of the figure, not inside any subplot.
-        legend_source_ax = next((ax for ax in [self.ax_bt, self.ax_ip, self.ax_loop, self.ax_halpha, self.ax_coils, self.ax_avantes] if ax is not None and ax.has_data()), None)
-        if legend_source_ax is not None:
-            handles, labels = legend_source_ax.get_legend_handles_labels()
-            by_label = dict(zip(labels, handles))
-            legend_labels = list(by_label.keys())
-            legend_handles = list(by_label.values())
+        if legend_entries:
+            base_labels = [label for _key, label, _color in legend_entries]
+            legend_labels = [
+                label if base_labels.count(label) == 1 else f'{label} [{i + 1}]'
+                for i, (_key, label, _color) in enumerate(legend_entries)
+            ]
+            legend_handles = [
+                Line2D([], [], color=color,
+                       linewidth=(3.2 if key in self.highlighted_shot_keys else
+                                  2.8 if key in self.selected_shot_keys else 2),
+                       alpha=(0.25 if self.highlighted_shot_keys
+                              and key not in self.highlighted_shot_keys else 1))
+                for key, _label, color in legend_entries
+            ]
             uses_folder_labels = any(',' in label for label in legend_labels)
             ncol = min(max(len(legend_labels), 1), 6)
-            self.fig.legend(
+            legend = self.fig.legend(
                 legend_handles,
                 legend_labels,
                 loc='upper center',
@@ -15673,6 +17467,17 @@ class ShotComparisonTab:
                 frameon=True,
                 borderaxespad=0.2
             )
+            handles = getattr(legend, 'legend_handles',
+                              getattr(legend, 'legendHandles', []))
+            self.legend_shot_targets = list(zip(
+                legend.get_texts(), handles,
+                (key for key, _label, _color in legend_entries)
+            ))
+            for legend_text, _handle, key in self.legend_shot_targets:
+                if key in self.selected_shot_keys:
+                    legend_text.set_fontweight('bold')
+                    legend_text.set_bbox(dict(facecolor='#fff2a8', edgecolor='none',
+                                              boxstyle='round,pad=0.2'))
 
         if self.ax_avantes is not None:
             if self.ax_avantes.has_data():
@@ -15729,6 +17534,11 @@ class ShotComparisonTab:
                 pass
 
         self.update_normalization_status_text()
+        if hasattr(self, 'normalization_label'):
+            label = get_normalization_label(self.normalization_mode)
+            if any(self.halpha_display_shift_ms.values()):
+                label += ' | Hα desplazada (prueba visual)'
+            self.normalization_label.config(text=label)
         try:
             self.fig.subplots_adjust(right=0.82)
         except Exception:
